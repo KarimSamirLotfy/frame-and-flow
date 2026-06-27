@@ -1,4 +1,4 @@
 data/
 .claude/
 __pycache__/
-media/
+media*/
