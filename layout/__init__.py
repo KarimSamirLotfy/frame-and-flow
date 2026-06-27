@@ -5,6 +5,7 @@ from .geometry import BBox, Flow, Side, is_parallel
 from .growth import (
     PlacedBlock,
     PosterBuilder,
+    RangeFractionPicker,
     WeightedFlowPicker,
     WeightedSidePicker,
 )
@@ -13,5 +14,5 @@ __all__ = [
     "BBox", "Flow", "Side", "is_parallel",
     "fill_side", "make_aspect_fn",
     "PosterBuilder", "PlacedBlock",
-    "WeightedSidePicker", "WeightedFlowPicker",
+    "WeightedSidePicker", "WeightedFlowPicker", "RangeFractionPicker",
 ]

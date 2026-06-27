@@ -19,10 +19,12 @@ from __future__ import annotations
 import os
 import random
 
-from manim import Scene, Text, VGroup
+from manim import Rectangle, Scene, Text, VGroup
 
 from layout import (
     PosterBuilder,
+    RangeFractionPicker,
+    Side,
     WeightedFlowPicker,
     WeightedSidePicker,
     fill_side,
@@ -33,10 +35,21 @@ from song_data import Song
 SONG_PATH = os.environ.get("HACKATUNE_SONG", "data/songs/song_666407.json")
 SEED = int(os.environ.get("HACKATUNE_SEED", "7"))
 END_TIME = float(os.environ.get("HACKATUNE_END", "0"))
+# how many lyric lines to lay out (anchor + this many). 0 = whole song.
+N_LINES = int(os.environ.get("HACKATUNE_NLINES", "6"))
+SHOW_DEBUG = os.environ.get("HACKATUNE_DEBUG", "0") == "1"
 
 ANCHOR_H = 2.2
 DIM = "#3a3a44"
 ACTIVE = "#ffffff"
+ANCHOR_BOX = "#ff4488"
+# per-side outline colors for debug
+SIDE_COLOR = {
+    Side.RIGHT: "#44aaff",
+    Side.DOWN: "#44ff88",
+    Side.LEFT: "#ffaa44",
+    Side.UP: "#cc66ff",
+}
 
 
 class SongPoster(Scene):
@@ -57,9 +70,12 @@ class SongPoster(Scene):
             aspect_of=make_aspect_fn(),
             side_picker=WeightedSidePicker(),
             flow_picker=WeightedFlowPicker(),
+            fraction_picker=RangeFractionPicker(0.70, 1.00),
+            full_fill_first=1,          # line 2 fills fully; line 3+ partial
             color=DIM,
         )
-        rest = [line.text.split() for line in song.lyrics[1:]]
+        upto = len(song.lyrics) if N_LINES <= 0 else min(N_LINES, len(song.lyrics))
+        rest = [line.text.split() for line in song.lyrics[1:upto]]
         placed = builder.build(anchor, rest, rng)
 
         # ---- centre the whole composition at the origin ------------------ #
@@ -67,6 +83,12 @@ class SongPoster(Scene):
         whole.move_to([0, 0, 0])
 
         self.add(whole)
+
+        # ---- debug outlines (drawn AFTER centering so they line up) ------- #
+        if SHOW_DEBUG:
+            self._outline(anchor, ANCHOR_BOX)
+            for p in placed:
+                self._outline(p.block, SIDE_COLOR[p.side])
 
         # ---- timed reveal (only when rendering video, not -s) ------------ #
         # anchor lights immediately; each line brightens at its start time.
@@ -79,7 +101,7 @@ class SongPoster(Scene):
                 self.wait(dt)
                 clock = t
 
-        for line, p in zip(song.lyrics[1:], placed):
+        for line, p in zip(song.lyrics[1:upto], placed):
             if line.start >= end:
                 break
             advance_to(line.start)
@@ -87,3 +109,11 @@ class SongPoster(Scene):
 
         advance_to(min(end, song.duration))
         self.wait(1.0)
+
+    # ------------------------------------------------------------------- #
+    def _outline(self, mob, color: str) -> None:
+        """Outline a mobject's bounding box (call AFTER all transforms)."""
+        b = Rectangle(width=max(mob.width, 0.01), height=max(mob.height, 0.01))
+        b.set_stroke(color, width=1.5, opacity=0.8).set_fill(opacity=0)
+        b.move_to(mob.get_center())
+        self.add(b)
