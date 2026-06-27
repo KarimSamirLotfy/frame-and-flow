@@ -30,6 +30,7 @@ from manim import (
     MovingCameraScene,
     Rectangle,
     Text,
+    ValueTracker,
     VGroup,
     smooth,
 )
@@ -99,11 +100,19 @@ class SongPoster(MovingCameraScene):
 
         # ---- centre the whole composition (positions are final now) ------ #
         # We compute the full layout up front so geometry is fixed, but reveal
-        # each block over time. Colour everything ACTIVE: it pops in bright.
+        # each WORD over time. `whole` is added to the scene ONCE so its rotation
+        # updater works; every word starts INVISIBLE (opacity 0) and is revealed
+        # by setting opacity to 1 at its timestamp — so words don't all show at
+        # once, and rotating `whole` doesn't force-add unrevealed words.
         whole = VGroup(anchor, *[p.block for p in placed])
         whole.move_to([0, 0, 0])
+        all_words = list(anchor_words)
         for p in placed:
             p.block.set_color(ACTIVE)
+            all_words.extend(p.word_mobjs)
+        for wmob in all_words:
+            wmob.set_opacity(0.0)
+        self.add(whole)
 
         # ---- timed build-up with moving camera --------------------------- #
         # Per line: glide the camera to frame the whole line (eased), then pop in
@@ -124,10 +133,15 @@ class SongPoster(MovingCameraScene):
         world_angle = 0.0
 
         def glide_to(target, target_text_angle: float, line_start: float) -> None:
-            """Rotate world so the line is upright + pan/zoom to it (eased)."""
+            """Rotate world so the line is upright + pan/zoom to it (eased).
+
+            IMPORTANT: we must NOT do `whole.animate.rotate(...)` — animating the
+            big group forces Manim to add ALL its members (every unrevealed word)
+            to the scene at once. Instead we rotate `whole` via a ValueTracker +
+            updater: the group's geometry (and thus its already-added word
+            children) rotates, while unrevealed words stay off-screen.
+            """
             nonlocal clock, world_angle
-            # After rotating the world by `delta`, the line's text angle becomes
-            # (target_text_angle + world_angle + delta); we want that == 0.
             delta = -(target_text_angle + world_angle)
             new_world_angle = world_angle + delta
 
@@ -135,14 +149,31 @@ class SongPoster(MovingCameraScene):
             run = min(run_glide(lead), lead) if lead > 1e-3 else CAM_MIN_GLIDE
             run = max(run, 1e-2)
 
-            anims = []
-            if abs(delta) > 1e-4:
-                anims.append(whole.animate.rotate(delta, about_point=ORIGIN))
-            # Predict where `target` will be AFTER the world rotation, to frame it.
             cx, cy, w, _ = self._frame_for_rotated(target, delta)
-            anims.append(self.camera.frame.animate.move_to([cx, cy, 0]).set(width=w))
 
-            self.play(*anims, run_time=run, rate_func=smooth)
+            if abs(delta) > 1e-4:
+                # incremental rotation driven by a tracker (no group add)
+                tracker = ValueTracker(0.0)
+                applied = {"a": 0.0}
+
+                def _rot(_m):
+                    step = tracker.get_value() - applied["a"]
+                    if abs(step) > 1e-9:
+                        whole.rotate(step, about_point=ORIGIN)
+                        applied["a"] = tracker.get_value()
+
+                whole.add_updater(_rot)
+                self.play(
+                    tracker.animate.set_value(delta),
+                    self.camera.frame.animate.move_to([cx, cy, 0]).set(width=w),
+                    run_time=run, rate_func=smooth,
+                )
+                whole.remove_updater(_rot)
+            else:
+                self.play(
+                    self.camera.frame.animate.move_to([cx, cy, 0]).set(width=w),
+                    run_time=run, rate_func=smooth,
+                )
             clock += run
             world_angle = new_world_angle
 
@@ -186,11 +217,10 @@ class SongPoster(MovingCameraScene):
             if t >= end:
                 break
             advance_to(t)
-            self.add(word_mobjs[i])
-        # add any leftover mobjs (count mismatch) at the line end, so nothing
-        # is silently dropped
+            word_mobjs[i].set_opacity(1.0)        # reveal this word
+        # reveal any leftover mobjs (count mismatch) so nothing is dropped
         for j in range(n, len(word_mobjs)):
-            self.add(word_mobjs[j])
+            word_mobjs[j].set_opacity(1.0)
 
     # ------------------------------------------------------------------- #
     def _frame_for(self, mob) -> tuple[float, float, float, float]:
