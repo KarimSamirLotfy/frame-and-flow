@@ -1,16 +1,34 @@
-"""Prototype: two lines that 'build' onto each other.
+"""Prototype: lyric lines that 'build' onto each other, side by side.
 
-Line 1 ("Woke up") is the anchor, rendered horizontally at a fixed height H.
-Line 2 ("in the car, glass on my shirt.") is split into parts, each ROTATED 90°
-(reads bottom-up) and scaled independently so that every part's rotated length
-== H. The parts stack left-to-right as columns, flush to the right edge of
-line 1 and aligned to its height — so line 2 looks like it grows out of line 1.
+A line is laid against a SIDE of the current shape. Two independent choices:
 
-Render:
-    uv run manim -pql build_scene.py BuildScene
+  ALIGN (which edge — sets the constraint):
+    V  (left/right edge)  -> constrained axis = HEIGHT (edge_len on y), width free
+    H  (top/bottom edge)  -> constrained axis = WIDTH  (edge_len on x), height free
 
-Debug (outline the anchor height H and each column):
-    HACKATUNE_DEBUG=1 uv run manim -pql build_scene.py BuildScene
+  FLOW (how the words run):
+    vertical    -> text rotated 90° (reads bottom->top), wraps into COLUMNS
+    horizontal  -> text upright (reads left->right), wraps into ROWS
+
+That's a 2x2 grid. The optimizer behaves differently depending on whether the
+text FLOW is parallel or perpendicular to the constrained edge:
+
+  FLOW ∥ EDGE  (Case 1: V+vertical, Case 3: H+horizontal)
+      Each part runs ALONG the edge. Wrap the words into parts and STRETCH gaps
+      so each part's along-edge extent fills edge_len exactly; parts tile across
+      the free axis. -> optimize WRAP + SPACING.
+
+  FLOW ⊥ EDGE  (Case 2: V+horizontal, Case 4: H+vertical)
+      Parts stack ACROSS the edge; their combined extent must equal edge_len,
+      while each part extends freely outward. -> optimize COUNT + SIZE.
+
+This prototype builds 3 steps:
+    step 1  "Woke up"                      anchor, horizontal
+    step 2  line 2 -> RIGHT  (Case 1: V align + vertical flow)
+    step 3  line 3 -> BOTTOM (Case 3: H align + horizontal flow)
+
+Render:        uv run manim -pql build_scene.py BuildScene
+Debug boxes:   HACKATUNE_DEBUG=1 uv run manim -pql build_scene.py BuildScene
 """
 
 from __future__ import annotations
@@ -18,28 +36,28 @@ from __future__ import annotations
 import os
 
 from manim import (
+    DOWN,
+    LEFT,
     PI,
     RIGHT,
-    UP,
     Rectangle,
     Scene,
     Text,
     VGroup,
+    config,
 )
 
 SHOW_DEBUG = os.environ.get("HACKATUNE_DEBUG", "0") == "1"
 
 # Anchor height for "Woke up" (Manim units). Everything keys off this.
 ANCHOR_H = 2.6
-COL_BUFF = 0.10      # base gap between line-2 columns
-PAIR_BUFF = 0.18     # gap between line 1 and line 2's block
+GAP_BASE = 0.10          # base gap between parts
+ATTACH_BUFF = 0.18       # gap between the existing shape and the new block
 
-# Wiggle room: the optimizer may pick a split whose *natural* block width is up
-# to this fraction of the target SHORTER than the target, then stretch the gaps
-# between columns to make up the difference. Bigger slack => the optimizer can
-# favour more balanced/readable splits instead of hitting width exactly.
-WIDTH_SLACK = 0.22       # allow natural width down to (1 - slack) * target
-MAX_STRETCH_BUFF = 0.55  # cap how wide a stretched gap may get (Manim units)
+# Optimizer wiggle room: a wrap's natural extent may sit up to `slack` below the
+# edge; gaps then stretch (capped) to fill exactly. Lets it pick balanced wraps.
+SLACK = 0.22
+MAX_STRETCH = 0.55
 
 DIM = "#46464f"
 ACTIVE = "#ffffff"
@@ -47,143 +65,238 @@ ACCENT = "#ff4488"
 
 LINE1 = "Woke up"
 LINE2_WORDS = ["in", "the", "car,", "glass", "on", "my", "shirt."]
+LINE3_WORDS = ["Neck", "on", "fire,", "can't", "even", "turn."]
+LINE4_WORDS = ["Doctor", "bills", "came,", "rent", "due", "tomorrow."]
+
+# line 2's columns are `BAND2` wide; line 3's rows are `BAND3` tall (free-axis).
+BAND2 = ANCHOR_H        # column cross-width target (tuned by optimizer anyway)
+BAND3 = 1.0             # line-3 row height (the free-axis size per part)
+BAND4 = ANCHOR_H        # line-4 column cross-width cap (left side, like line 2)
 
 
-def _measure_aspect(text: str) -> float:
-    """Real rendered aspect (width / height) of a text string at unit scale."""
+# --------------------------------------------------------------------------- #
+# Measurement
+# --------------------------------------------------------------------------- #
+def _aspect(text: str) -> float:
+    """Real rendered aspect (width / height) of a string at unit scale."""
     t = Text(text)
     return t.width / t.height if t.height > 0 else 1.0
 
 
-def _split_to_match_width(words: list[str], target_w: float, anchor_h: float,
-                          col_buff: float, slack: float,
-                          max_stretch: float) -> tuple[list[str], float]:
-    """Choose word groups for a rotated block ≈ target wide, with gap slack.
-
-    Each part is rotated and scaled so its rotated *length* == anchor_h. After
-    rotation a part's on-screen width = anchor_h / aspect (aspect = measured
-    width/height). Long part → narrow column; short part → wide column.
-
-    Instead of forcing the column widths to hit `target_w` exactly, we allow the
-    natural block width to be as little as (1 - slack) * target_w, then STRETCH
-    the inter-column gaps to fill the remaining width. Within that tolerance we
-    prefer the most *balanced* split (columns of similar width) so the block
-    reads well rather than being one fat column + one sliver.
-
-    Returns (parts, stretched_buff): the chosen strings and the gap to use
-    between columns when laying them out.
-    """
+def _all_wraps(words: list[str]):
+    """Yield every contiguous wrap of `words` as a list of (start, end) ranges."""
     n = len(words)
-    aspect_cache: dict[tuple[int, int], float] = {}
-
-    def run_aspect(i: int, j: int) -> float:
-        if (i, j) not in aspect_cache:
-            aspect_cache[(i, j)] = _measure_aspect(" ".join(words[i:j]))
-        return aspect_cache[(i, j)]
-
-    min_natural = (1.0 - slack) * target_w
-
-    best_parts: list[tuple[int, int]] | None = None
-    best_buff = col_buff
-    best_score = float("inf")
-
     for mask in range(1 << (n - 1)):
-        parts: list[tuple[int, int]] = []
-        start = 0
+        parts, start = [], 0
         for i in range(1, n):
             if mask & (1 << (i - 1)):
                 parts.append((start, i))
                 start = i
         parts.append((start, n))
+        yield parts
 
-        widths = [anchor_h / run_aspect(i, j) for (i, j) in parts]
-        n_gaps = len(parts) - 1
-        sum_w = sum(widths)
 
-        # Need at least one gap, and the columns alone must not exceed target.
-        if n_gaps == 0 or sum_w > target_w:
-            continue
+# --------------------------------------------------------------------------- #
+# Optimizer — FLOW ∥ EDGE  (each part stretched to fill the edge length)
+# --------------------------------------------------------------------------- #
+def optimize_parallel(words: list[str], edge_len: float, _band_max: float
+                      ) -> tuple[list[str], float, float]:
+    """FLOW ∥ EDGE (Cases 1 & 3): each part individually fills edge_len.
 
-        # The gaps must close the remaining distance to target without
-        # exceeding the stretch cap (or dropping below the base gap).
-        needed_buff = (target_w - sum_w) / n_gaps
-        if needed_buff > max_stretch:
-            continue                      # can't stretch far enough -> too few parts
-        buff = max(col_buff, needed_buff)
-        achieved_w = sum_w + buff * n_gaps
-        if achieved_w < min_natural:
-            continue                      # still too narrow even at base gap
+    Every part is scaled so its ALONG-edge extent == edge_len exactly (e.g. each
+    rotated column is as tall as the edge). Parts then tile across the FREE axis,
+    where each part's cross-thickness = edge_len / aspect. We optimise the WRAP
+    so the resulting cross-thicknesses are balanced (columns of similar width)
+    and the block isn't lopsided. The returned `band` is unused here (parts are
+    scaled to edge_len directly), so we return 0; the gap is the base gap.
 
-        # Score: prefer balanced columns (low width variance), and prefer gaps
-        # close to the base (less obvious stretching). No bias toward fewer
-        # parts — the target width naturally selects the right count.
-        mean_w = sum_w / len(widths)
-        variance = sum((w - mean_w) ** 2 for w in widths) / len(widths)
-        score = variance + 0.4 * abs(buff - col_buff)
+    Returns (parts, gap, band=0). The caller scales each part to edge_len.
+    """
+    best, best_score = None, float("inf")
 
+    for parts in _all_wraps(words):
+        # cross-thickness of each part if scaled so its along-extent == edge_len:
+        #   along = edge_len  =>  cross = edge_len / aspect
+        crosses = [edge_len / _aspect(" ".join(words[i:j])) for (i, j) in parts]
+        k = len(parts)
+        mean_c = sum(crosses) / k
+        variance = sum((c - mean_c) ** 2 for c in crosses) / k
+        # prefer 2-4 balanced parts: penalise 1 (no "build") and many (too thin)
+        count_pen = 0.0 if 2 <= k <= 4 else 0.6
+        score = variance + count_pen + 0.04 * k
         if score < best_score:
-            best_score = score
-            best_parts = parts
-            best_buff = buff
+            best, best_score = parts, score
 
-    if best_parts is None:
-        # Fallback: whole line as one column.
-        return [" ".join(words)], 0.0
-
-    return [" ".join(words[i:j]) for (i, j) in best_parts], best_buff
+    if best is None:
+        return [" ".join(words)], GAP_BASE, 0.0
+    return [" ".join(words[i:j]) for (i, j) in best], GAP_BASE, 0.0
 
 
+# --------------------------------------------------------------------------- #
+# Optimizer — FLOW ⊥ EDGE  (parts stack across; total stack == edge_len)
+# --------------------------------------------------------------------------- #
+def optimize_perpendicular(words: list[str], edge_len: float
+                           ) -> tuple[list[str], float, float]:
+    """FLOW ⊥ EDGE (Cases 2 & 4): choose count + size so the STACK fills edge_len.
+
+    Parts stack across the edge. We scale all parts to a common free-axis `band`
+    so their stacked extent (sum of bands + gaps) == edge_len, and each part
+    extends freely outward. We pick the wrap minimising outward-depth variance
+    (so the block stays roughly square), returning the band to use.
+
+    Returns (parts, gap, band).
+    """
+    best, best_score = None, float("inf")
+
+    for parts in _all_wraps(words):
+        k = len(parts)
+        if k < 1:
+            continue
+        # stack of k parts + (k-1) base gaps must equal edge_len:
+        band = (edge_len - GAP_BASE * (k - 1)) / k
+        if band <= 0.05:
+            continue
+        # each part's outward depth = band * aspect; prefer balanced depths
+        depths = [band * _aspect(" ".join(words[i:j])) for (i, j) in parts]
+        mean_d = sum(depths) / len(depths)
+        variance = sum((d - mean_d) ** 2 for d in depths) / len(depths)
+        # prefer the block to be roughly square: depth ≈ edge_len
+        squareness = abs(max(depths) - edge_len) / edge_len
+        score = variance + 0.5 * squareness + 0.05 * k
+        if score < best_score:
+            best, best_score, best_band = parts, score, band
+
+    if best is None:
+        return [" ".join(words)], 0.0, edge_len
+    return [" ".join(words[i:j]) for (i, j) in best], GAP_BASE, best_band
+
+
+# --------------------------------------------------------------------------- #
+# Unified side-filler
+# --------------------------------------------------------------------------- #
+ROT = {"vertical": PI / 2, "horizontal": 0.0}
+
+
+def fill_side(words: list[str], align: str, flow: str, edge_len: float,
+              band: float, color: str) -> tuple[VGroup, list[str]]:
+    """Build a block filling an edge, per the (align, flow) case.
+
+    align: "V" (left/right, height-constrained) or "H" (top/bottom, width-constrained)
+    flow:  "vertical" (rotated columns) or "horizontal" (upright rows)
+    edge_len: the constrained length to fill.
+    band: free-axis size per part (used when flow ∥ edge).
+    """
+    parallel = (align == "V" and flow == "vertical") or \
+               (align == "H" and flow == "horizontal")
+
+    rot = ROT[flow]
+
+    if parallel:
+        # Case 1 & 3: each part individually scaled so its ALONG-edge extent ==
+        # edge_len; parts tile across the FREE axis.
+        parts, gap, _ = optimize_parallel(words, edge_len, band)
+        mobjs: list[Text] = []
+        for part in parts:
+            t = Text(part, color=color)
+            if rot:
+                t.rotate(rot)
+            # after any rotation, the along-edge axis is height for V, width for H
+            if align == "V":
+                t.scale(edge_len / t.height)
+            else:
+                t.scale(edge_len / t.width)
+            mobjs.append(t)
+        # tile across the FREE axis: V -> rightward (x), H -> downward (y)
+        direction = RIGHT if align == "V" else DOWN
+        block = VGroup(*mobjs).arrange(direction, buff=gap)
+
+    else:
+        # Case 2 & 4: parts stack ACROSS the edge; total stack == edge_len.
+        parts, gap, band = optimize_perpendicular(words, edge_len)
+        mobjs = []
+        for part in parts:
+            t = Text(part, color=color)
+            t.scale(band / t.height)     # free-axis size == band (pre-rotation)
+            if rot:
+                t.rotate(rot)
+            mobjs.append(t)
+        # tile ALONG the edge: V -> down (y), H -> right (x)
+        direction = DOWN if align == "V" else RIGHT
+        block = VGroup(*mobjs).arrange(direction, buff=gap)
+
+    return block, parts
+
+
+# --------------------------------------------------------------------------- #
+# Scene — the 3-step build
+# --------------------------------------------------------------------------- #
 class BuildScene(Scene):
     def construct(self) -> None:
-        # ---- Line 1: anchor, horizontal, fixed height H ------------------- #
+        # ---- Step 1: anchor ---------------------------------------------- #
         anchor = Text(LINE1, color=ACTIVE)
-        anchor.scale(ANCHOR_H / anchor.height)   # set its height to exactly H
+        anchor.scale(ANCHOR_H / anchor.height)
+        self.add(anchor)
 
-        # ---- Optimize line-2 split so its block width ≈ anchor height ----- #
-        parts, stretch_buff = _split_to_match_width(
-            LINE2_WORDS, ANCHOR_H, ANCHOR_H, COL_BUFF,
-            WIDTH_SLACK, MAX_STRETCH_BUFF,
+        # ---- Step 2: RIGHT, Case 1 (V align + vertical flow) ------------- #
+        block2, parts2 = fill_side(
+            LINE2_WORDS, align="V", flow="vertical",
+            edge_len=anchor.height, band=BAND2, color=DIM,
         )
-        print(f"[split] {len(parts)} parts: {parts}  gap={stretch_buff:.3f}")
+        block2.next_to(anchor, RIGHT, buff=ATTACH_BUFF)
+        block2.set_y(anchor.get_y())
+        print(f"[step2] RIGHT  V+vertical   {len(parts2)} parts: {parts2}")
+        self.add(block2)
 
-        # ---- Line 2: parts, each rotated 90°, each scaled so length == H -- #
-        columns: list[Text] = []
-        for part in parts:
-            t = Text(part, color=DIM)
-            t.rotate(PI / 2)                      # now reads bottom-up
-            # After rotation, t.height is the text's *length*. Make it == H.
-            t.scale(ANCHOR_H / t.height)
-            columns.append(t)
+        shape = VGroup(anchor, block2)
 
-        line2_block = VGroup(*columns).arrange(RIGHT, buff=stretch_buff)
+        # ---- Step 3: BOTTOM, Case 3 (H align + horizontal flow) ---------- #
+        block3, parts3 = fill_side(
+            LINE3_WORDS, align="H", flow="horizontal",
+            edge_len=shape.width, band=BAND3, color=DIM,
+        )
+        block3.next_to(shape, DOWN, buff=ATTACH_BUFF)
+        block3.set_x(shape.get_x())
+        print(f"[step3] BOTTOM H+horizontal {len(parts3)} parts: {parts3}")
+        self.add(block3)
 
-        # ---- Assemble: line2 block flush-right of anchor, same height ----- #
-        whole = VGroup(anchor, line2_block).arrange(RIGHT, buff=PAIR_BUFF)
-        # Vertically align the two so their centers (and thus heights) line up.
-        line2_block.align_to(anchor, UP)
+        shape = VGroup(anchor, block2, block3)
+
+        # ---- Step 4: LEFT, Case 1 (V align + vertical flow) -------------- #
+        # Fills the LEFT edge of the WHOLE shape (its full height) with columns.
+        block4, parts4 = fill_side(
+            LINE4_WORDS, align="V", flow="vertical",
+            edge_len=shape.height, band=BAND4, color=DIM,
+        )
+        block4.next_to(shape, LEFT, buff=ATTACH_BUFF)
+        block4.set_y(shape.get_y())
+        print(f"[step4] LEFT   V+vertical   {len(parts4)} parts: {parts4}")
+        self.add(block4)
+
+        # ---- Fit whole composition in frame ------------------------------ #
+        whole = VGroup(anchor, block2, block3, block4)
         whole.move_to([0, 0, 0])
+        fw, fh = config.frame_width * 0.96, config.frame_height * 0.96
+        s = min(fw / whole.width, fh / whole.height, 1.0)
+        if s < 1.0:
+            whole.scale(s)
 
+        # ---- Debug boxes LAST, from final positions ---------------------- #
+        # (drawn after fit-to-frame so they match where the text actually is)
         if SHOW_DEBUG:
-            self._add_debug(anchor, columns)
+            self._box(anchor, ACCENT)
+            for c in block2:
+                self._box(c, "#44aaff")
+            for c in block3:
+                self._box(c, "#44ff88")
+            for c in block4:
+                self._box(c, "#ffaa44")
 
-        # ---- "Building" reveal: anchor first, then columns in order ------- #
-        anchor.set_opacity(1.0)
-        for c in columns:
-            c.set_opacity(1.0)
-
-        self.add(whole)
         self.wait(1.0)
 
-    # ----------------------------------------------------------------------- #
-    def _add_debug(self, anchor: Text, columns: list[Text]) -> None:
-        # Box around the anchor.
-        ab = Rectangle(width=anchor.width, height=anchor.height)
-        ab.set_stroke(ACCENT, width=1.5, opacity=0.7).set_fill(opacity=0)
-        ab.move_to(anchor.get_center())
-        self.add(ab)
-        # Box around each column.
-        for c in columns:
-            cb = Rectangle(width=c.width, height=c.height)
-            cb.set_stroke("#44aaff", width=1.5, opacity=0.7).set_fill(opacity=0)
-            cb.move_to(c.get_center())
-            self.add(cb)
+    # ------------------------------------------------------------------- #
+    def _box(self, mob, color: str) -> None:
+        """Outline a mobject's current bounding box (call AFTER all transforms)."""
+        b = Rectangle(width=max(mob.width, 0.01), height=max(mob.height, 0.01))
+        b.set_stroke(color, width=1.5, opacity=0.7).set_fill(opacity=0)
+        b.move_to(mob.get_center())
+        self.add(b)
