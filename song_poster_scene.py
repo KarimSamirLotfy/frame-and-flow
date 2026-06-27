@@ -49,8 +49,8 @@ from song_data import Song
 SONG_PATH = os.environ.get("HACKATUNE_SONG", "data/songs/song_666407.json")
 SEED = int(os.environ.get("HACKATUNE_SEED", "7"))
 END_TIME = float(os.environ.get("HACKATUNE_END", "0"))
-# how many lyric lines to lay out (anchor + this many). 0 = whole song.
-N_LINES = int(os.environ.get("HACKATUNE_NLINES", "6"))
+# how many lyric lines to lay out (anchor + this many). 0 = whole song (default).
+N_LINES = int(os.environ.get("HACKATUNE_NLINES", "0"))
 SHOW_DEBUG = os.environ.get("HACKATUNE_DEBUG", "0") == "1"
 
 ANCHOR_H = 2.2
@@ -67,7 +67,7 @@ SIDE_COLOR = {
 
 # Camera framing
 CAM_MARGIN = 1.6      # extra world-units of padding around the framed line
-CAM_MIN_W = 6.0      # don't zoom in tighter than this frame width (tiny lines)
+# no zoom-in floor: the camera frames each line + margin exactly, however small
 CAM_MAX_GLIDE = 1.1  # longest a single camera glide takes (seconds)
 CAM_MIN_GLIDE = 0.35 # shortest glide, so motion always reads as eased
 
@@ -255,7 +255,7 @@ class SongPoster(MovingCameraScene):
         aspect = self.camera.frame.width / self.camera.frame.height
         need_w = content_w + 2 * CAM_MARGIN
         need_h = content_h + 2 * CAM_MARGIN
-        w = max(need_w, need_h * aspect, CAM_MIN_W)
+        w = max(need_w, need_h * aspect)   # fit both axes; no zoom-in floor
         h = w / aspect
         return center[0], center[1], w, h
 
