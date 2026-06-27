@@ -48,6 +48,10 @@ from song_data import Song
 
 SONG_PATH = os.environ.get("HACKATUNE_SONG", "data/songs/song_666407.json")
 SEED = int(os.environ.get("HACKATUNE_SEED", "7"))
+# render window: only emit frames for [START_TIME, END_TIME]. Before START_TIME
+# the build-up is fast-forwarded (state applied instantly, no frames) so you can
+# preview just a slice (e.g. the last 30s) without waiting for the whole render.
+START_TIME = float(os.environ.get("HACKATUNE_START", "0"))
 END_TIME = float(os.environ.get("HACKATUNE_END", "0"))
 # how many lyric lines to lay out (anchor + this many). 0 = whole song (default).
 N_LINES = int(os.environ.get("HACKATUNE_NLINES", "0"))
@@ -123,11 +127,16 @@ class SongPoster(MovingCameraScene):
         # time, tracked by the clock so word reveals stay in sync.
         clock = 0.0
 
+        def rendering() -> bool:
+            return clock >= START_TIME
+
         def advance_to(t: float) -> None:
             nonlocal clock
             dt = t - clock
             if dt > 1e-3:
-                self.wait(dt)
+                if rendering():
+                    self.wait(dt)        # real time, emits frames
+                # else: fast-forward, just advance the clock (no frames)
                 clock = t
 
         # Camera can't rotate in v0.20.1, so we ROTATE THE WORLD instead: spin
@@ -153,6 +162,15 @@ class SongPoster(MovingCameraScene):
             run = max(run, 1e-2)
 
             cx, cy, w, _ = self._frame_for_rotated(target, delta)
+
+            if not rendering():
+                # fast-forward: apply the END state of the glide instantly.
+                if abs(delta) > 1e-4:
+                    whole.rotate(delta, about_point=ORIGIN)
+                self.camera.frame.move_to([cx, cy, 0]).set(width=w)
+                clock += run
+                world_angle = new_world_angle
+                return
 
             if abs(delta) > 1e-4:
                 # incremental rotation driven by a tracker (no group add)
