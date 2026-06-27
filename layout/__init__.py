@@ -7,12 +7,11 @@ from .growth import (
     PosterBuilder,
     RangeFractionPicker,
     WeightedFlowPicker,
-    WeightedSidePicker,
 )
 
 __all__ = [
     "BBox", "Flow", "Side", "is_parallel",
     "fill_side", "make_aspect_fn",
     "PosterBuilder", "PlacedBlock",
-    "WeightedSidePicker", "WeightedFlowPicker", "RangeFractionPicker",
+    "WeightedFlowPicker", "RangeFractionPicker",
 ]

@@ -26,7 +26,6 @@ from layout import (
     RangeFractionPicker,
     Side,
     WeightedFlowPicker,
-    WeightedSidePicker,
     fill_side,
     make_aspect_fn,
 )
@@ -68,10 +67,8 @@ class SongPoster(Scene):
         builder = PosterBuilder(
             fill=fill_side,
             aspect_of=make_aspect_fn(),
-            side_picker=WeightedSidePicker(),
             flow_picker=WeightedFlowPicker(),
             fraction_picker=RangeFractionPicker(0.70, 1.00),
-            full_fill_first=1,          # line 2 fills fully; line 3+ partial
             color=DIM,
         )
         upto = len(song.lyrics) if N_LINES <= 0 else min(N_LINES, len(song.lyrics))

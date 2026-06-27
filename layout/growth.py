@@ -1,27 +1,28 @@
-"""Growth engine: chain lyric lines into a build-up around a growing shape.
+"""Growth engine: build a lyric composition by an EDGE TREE.
 
-Responsibilities are split so each can change independently (SOLID):
+Model (recursive sub-edges — no flat global sides, no marching outward):
 
-  SidePicker (Strategy)  — decides the next Side. `WeightedSidePicker` is
-      pseudo-random biased right/down; swap in another strategy (spiral, longest
-      edge) without touching the builder (Open/Closed).
+  * Every placed block exposes its 3 OUTER free edges (all but the one touching
+    its parent) as new candidate edges in a pool.
+  * Each line picks an available edge (pseudo-random, biased toward right/down
+    facing edges), is sized to fill 70-100% of THAT edge, and snaps flush to it.
+  * Because a child is sized to the specific (smaller) edge it builds on, it
+    never overflows and child edges only shrink — growth is bounded by design.
 
-  FlowPicker (Strategy)  — decides the Flow per line (independent of the side).
+SOLID split:
+  Edge / EdgePool      — the geometry of available build sites.
+  *Picker strategies   — choose edge / flow / fill-fraction (swappable).
+  PlacedBlock          — a built block + its bbox + provenance.
+  PosterBuilder        — orchestration only; depends on `fill_side` + pickers
+                         through interfaces, not concretions.
 
-  PlacedBlock            — a built block + the BBox it occupies once positioned.
-
-  PosterBuilder          — owns the loop: for each line, ask the pickers for a
-      side/flow, fill it, position it flush OUTSIDE the current bounding box on
-      that side (provably overlap-free), and grow the bbox.
-
-The builder depends on the `fill_side` callable and the pickers via interfaces,
-not concretions — so rendering, sizing and strategy are all decoupled.
+Only `_mobj_bbox` and the placement math touch Manim; the rest is pure.
 """
 
 from __future__ import annotations
 
 import random
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Callable, Protocol
 
 from manim import VGroup
@@ -33,30 +34,57 @@ FillFn = Callable[..., VGroup]
 
 
 # --------------------------------------------------------------------------- #
+# Edge geometry
+# --------------------------------------------------------------------------- #
+@dataclass
+class Edge:
+    """A free edge a block can build on.
+
+    `facing` is the outward direction (a block on this edge grows that way).
+    The edge is a segment: for a vertical-facing edge (RIGHT/LEFT) it runs in y
+    from `lo` (bottom) to `hi` (top) at x == `outer`; for a horizontal-facing
+    edge (UP/DOWN) it runs in x from `lo` (left) to `hi` (right) at y == `outer`.
+    """
+
+    facing: Side
+    outer: float        # the fixed coordinate of the edge (x for L/R, y for U/D)
+    lo: float           # segment start (min along the edge axis)
+    hi: float           # segment end   (max along the edge axis)
+
+    @property
+    def length(self) -> float:
+        return self.hi - self.lo
+
+
+class EdgePool:
+    """Holds available edges; picks one (weighted by facing direction)."""
+
+    def __init__(self, edges: list[Edge] | None = None) -> None:
+        self._edges: list[Edge] = list(edges or [])
+
+    def __len__(self) -> int:
+        return len(self._edges)
+
+    def add(self, *edges: Edge) -> None:
+        self._edges.extend(e for e in edges if e.length > 1e-3)
+
+    def pop_weighted(self, weights: dict[Side, float],
+                     rng: random.Random) -> Edge:
+        """Remove and return an edge, chosen by its facing-direction weight."""
+        w = [weights.get(e.facing, 0.01) for e in self._edges]
+        idx = rng.choices(range(len(self._edges)), weights=w)[0]
+        return self._edges.pop(idx)
+
+
+# --------------------------------------------------------------------------- #
 # Strategies
 # --------------------------------------------------------------------------- #
-class SidePicker(Protocol):
-    def __call__(self, rng: random.Random) -> Side: ...
-
-
 class FlowPicker(Protocol):
     def __call__(self, rng: random.Random) -> Flow: ...
 
 
-@dataclass
-class WeightedSidePicker:
-    """Pseudo-random side, biased toward growing right and down."""
-
-    weights: dict[Side, float] = field(default_factory=lambda: {
-        Side.RIGHT: 0.40,
-        Side.DOWN: 0.35,
-        Side.LEFT: 0.15,
-        Side.UP: 0.10,
-    })
-
-    def __call__(self, rng: random.Random) -> Side:
-        sides = list(self.weights.keys())
-        return rng.choices(sides, weights=[self.weights[s] for s in sides])[0]
+class FractionPicker(Protocol):
+    def __call__(self, rng: random.Random) -> float: ...
 
 
 @dataclass
@@ -69,18 +97,9 @@ class WeightedFlowPicker:
         return Flow.VERTICAL if rng.random() < self.p_vertical else Flow.HORIZONTAL
 
 
-class FractionPicker(Protocol):
-    def __call__(self, rng: random.Random) -> float: ...
-
-
 @dataclass
 class RangeFractionPicker:
-    """Fraction of the edge a line fills, in [lo, hi].
-
-    Filling < 1.0 makes the block SMALLER than the edge, which is what stops the
-    exponential blowup: a small block grows the bbox only a little. The partial
-    block packs along the edge (see SideSpans) so same-side blocks never overlap.
-    """
+    """Fraction of the chosen edge a line fills, in [lo, hi]."""
 
     lo: float = 0.70
     hi: float = 1.00
@@ -89,126 +108,75 @@ class RangeFractionPicker:
         return rng.uniform(self.lo, self.hi)
 
 
+# Edge-facing bias: prefer building toward the right and down.
+DEFAULT_SIDE_WEIGHTS: dict[Side, float] = {
+    Side.RIGHT: 0.40, Side.DOWN: 0.35, Side.LEFT: 0.15, Side.UP: 0.10,
+}
+
+
 # --------------------------------------------------------------------------- #
 # Builder
 # --------------------------------------------------------------------------- #
 @dataclass
 class PlacedBlock:
     block: VGroup
-    side: Side
+    side: Side               # the facing direction of the edge it was built on
     flow: Flow
     bbox: BBox
-    fraction: float          # how much of the edge this line filled
-
-
-@dataclass
-class Shelf:
-    """An open packing shelf along one side.
-
-    `outer`    fixed coordinate of the side's outer edge (x for L/R, y for U/D),
-               captured when the shelf opened — every block on the shelf shares
-               this edge line instead of marching outward as the bbox grows.
-    `start`    fixed start-corner coordinate ALONG the edge (top for L/R, left
-               for U/D), so packing offsets stay anchored even as the bbox grows.
-    `edge_len` the edge length when the shelf opened (target fractions use this,
-               so all blocks on the shelf size against the same edge).
-    `offset`   distance already packed along the edge from `start`.
-    """
-
-    outer: float
-    start: float
-    edge_len: float
-    offset: float = 0.0
-
-
-class ShelfBook:
-    """Per-side open shelves. A shelf opens on first use and reopens when full."""
-
-    def __init__(self) -> None:
-        self._shelves: dict[Side, Shelf | None] = {s: None for s in Side}
-
-    def get(self, side: Side) -> Shelf | None:
-        return self._shelves[side]
-
-    def open(self, side: Side, outer: float, start: float,
-             edge_len: float) -> Shelf:
-        shelf = Shelf(outer=outer, start=start, edge_len=edge_len)
-        self._shelves[side] = shelf
-        return shelf
+    fraction: float          # how much of the chosen edge it filled
 
 
 class PosterBuilder:
-    """Chains lines into a build-up. Pure orchestration; no Manim scene calls."""
+    """Chains lines onto an edge tree. Pure orchestration; no Manim scene calls."""
 
     def __init__(
         self,
         fill: FillFn,
         aspect_of,
-        side_picker: SidePicker,
         flow_picker: FlowPicker,
         fraction_picker: FractionPicker,
-        full_fill_first: int = 1,
+        side_weights: dict[Side, float] | None = None,
         attach_buff: float = 0.16,
         color: str = "#46464f",
     ) -> None:
         self._fill = fill
         self._aspect = aspect_of
-        self._pick_side = side_picker
         self._pick_flow = flow_picker
         self._pick_fraction = fraction_picker
-        # number of leading lines that always fill their side fully (line 2 = 1)
-        self._full_fill_first = full_fill_first
+        self._weights = side_weights or DEFAULT_SIDE_WEIGHTS
         self._buff = attach_buff
         self._color = color
 
     def build(self, anchor: VGroup, lines: list[list[str]],
               rng: random.Random) -> list[PlacedBlock]:
-        """Place each line around `anchor`. Returns the placed blocks in order."""
-        bbox = _mobj_bbox(anchor)
-        book = ShelfBook()
+        """Place each line onto the growing edge tree seeded by `anchor`."""
+        abox = _mobj_bbox(anchor)
+        pool = EdgePool(_edges_of(abox))   # anchor seeds all 4 of its edges
         placed: list[PlacedBlock] = []
 
-        for idx, words in enumerate(lines):
-            side = self._pick_side(rng)
+        for words in lines:
+            if len(pool) == 0:
+                break
+
+            edge = pool.pop_weighted(self._weights, rng)
             flow = self._pick_flow(rng)
+            fraction = self._pick_fraction(rng)
 
-            full = idx < self._full_fill_first
-            fraction = 1.0 if full else self._pick_fraction(rng)
-
-            # Find or open the shelf for this side. A shelf shares ONE fixed
-            # outer edge + start corner + edge_len so same-side blocks pack ALONG
-            # it (perpendicular to the growth axis), each sized against the same
-            # edge. We reopen only on a full-fill or when the shelf is full.
-            shelf = book.get(side)
-            need_target = fraction * bbox.edge_length(side)
-            if full or shelf is None or shelf.offset + need_target > \
-                    shelf.edge_len + 1e-6:
-                shelf = book.open(
-                    side,
-                    outer=_outer_coord(bbox, side),
-                    start=_start_coord(bbox, side),
-                    edge_len=bbox.edge_length(side),
-                )
-
-            # Fraction is OF THE SHELF'S EDGE, packed from its start corner.
-            target = shelf.edge_len if full else fraction * shelf.edge_len
-
-            block = self._fill(words, side, flow, target, self._color,
+            target = fraction * edge.length
+            block = self._fill(words, edge.facing, flow, target, self._color,
                                self._aspect)
-            _place_on_shelf(block, side, shelf, self._buff)
 
-            along = block.height if side.is_vertical_edge else block.width
-            shelf.offset += along + self._buff
+            bbox = _place_on_edge(block, edge, self._buff)
 
-            block_bbox = _mobj_bbox(block)
-            bbox = bbox.union(block_bbox)
-            placed.append(PlacedBlock(block, side, flow, block_bbox, fraction))
+            # Expose the block's 3 OUTER edges (all but the one facing the parent).
+            pool.add(*_outer_edges(bbox, parent_facing=edge.facing))
+            placed.append(PlacedBlock(block, edge.facing, flow, bbox, fraction))
 
         return placed
 
 
 # --------------------------------------------------------------------------- #
-# Manim placement helpers (the only Manim-touching code here)
+# Geometry helpers (Manim-touching: _mobj_bbox, _place_on_edge)
 # --------------------------------------------------------------------------- #
 def _mobj_bbox(mob) -> BBox:
     c = mob.get_center()
@@ -216,35 +184,49 @@ def _mobj_bbox(mob) -> BBox:
     return BBox(c[0] - w / 2, c[1] - h / 2, c[0] + w / 2, c[1] + h / 2)
 
 
-def _outer_coord(bbox: BBox, side: Side) -> float:
-    """The coordinate of `side`'s outer edge (x for L/R, y for U/D)."""
-    return {
-        Side.RIGHT: bbox.x1, Side.LEFT: bbox.x0,
-        Side.UP: bbox.y1, Side.DOWN: bbox.y0,
-    }[side]
+def _edges_of(box: BBox) -> list[Edge]:
+    """All 4 edges of a box (used to seed the anchor)."""
+    return [
+        Edge(Side.RIGHT, box.x1, box.y0, box.y1),
+        Edge(Side.LEFT,  box.x0, box.y0, box.y1),
+        Edge(Side.UP,    box.y1, box.x0, box.x1),
+        Edge(Side.DOWN,  box.y0, box.x0, box.x1),
+    ]
 
 
-def _start_coord(bbox: BBox, side: Side) -> float:
-    """Start-corner coordinate ALONG the edge: top for L/R, left for U/D."""
-    return bbox.y1 if side.is_vertical_edge else bbox.x0
+def _outer_edges(box: BBox, parent_facing: Side) -> list[Edge]:
+    """The 3 outer edges of `box`, excluding the side facing back to the parent.
+
+    A block built on a RIGHT-facing edge touches its parent on its LEFT, so its
+    LEFT edge is not exposed; its RIGHT/UP/DOWN edges are.
+    """
+    opposite = {
+        Side.RIGHT: Side.LEFT, Side.LEFT: Side.RIGHT,
+        Side.UP: Side.DOWN, Side.DOWN: Side.UP,
+    }[parent_facing]
+    return [e for e in _edges_of(box) if e.facing is not opposite]
 
 
-def _place_on_shelf(block: VGroup, side: Side, shelf, buff: float) -> None:
-    """Place `block` on `side`'s shelf: fixed outer edge, packed along from start.
+def _place_on_edge(block: VGroup, edge: Edge, buff: float) -> BBox:
+    """Snap `block` flush OUTSIDE `edge`, aligned to the edge's start corner.
 
-    All coordinates come from the SHELF (captured when it opened), so same-side
-    blocks share one outer edge line and one start corner — they pack ALONG the
-    edge (perpendicular to the growth axis) without marching outward. Packing:
-        RIGHT / LEFT  -> downward from the top corner
-        UP   / DOWN   -> rightward from the left corner
+    The block was sized to `fraction * edge.length`, so it fits within the edge
+    segment. It's placed just beyond `edge.outer` (by `buff`), anchored at the
+    edge's start corner (top for vertical edges, left for horizontal), packing
+    inward along the segment. Returns the block's resulting bbox.
     """
     bw, bh = block.width, block.height
-    off = shelf.offset
-    if side is Side.RIGHT:
-        block.move_to([shelf.outer + buff + bw / 2, shelf.start - off - bh / 2, 0])
-    elif side is Side.LEFT:
-        block.move_to([shelf.outer - buff - bw / 2, shelf.start - off - bh / 2, 0])
-    elif side is Side.UP:
-        block.move_to([shelf.start + off + bw / 2, shelf.outer + buff + bh / 2, 0])
+    if edge.facing is Side.RIGHT:
+        cx = edge.outer + buff + bw / 2
+        cy = edge.hi - bh / 2                 # from the top corner, downward
+    elif edge.facing is Side.LEFT:
+        cx = edge.outer - buff - bw / 2
+        cy = edge.hi - bh / 2
+    elif edge.facing is Side.UP:
+        cx = edge.lo + bw / 2                 # from the left corner, rightward
+        cy = edge.outer + buff + bh / 2
     else:  # DOWN
-        block.move_to([shelf.start + off + bw / 2, shelf.outer - buff - bh / 2, 0])
+        cx = edge.lo + bw / 2
+        cy = edge.outer - buff - bh / 2
+    block.move_to([cx, cy, 0])
+    return _mobj_bbox(block)
