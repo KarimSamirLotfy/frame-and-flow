@@ -124,6 +124,7 @@ class PlacedBlock:
     flow: Flow
     bbox: BBox
     fraction: float          # how much of the chosen edge it filled
+    word_mobjs: list         # each word's mobject, in reading order
 
 
 class PosterBuilder:
@@ -170,10 +171,11 @@ class PosterBuilder:
             result = self._place_one(words, pool, occupied, rng)
             if result is None:
                 continue                   # couldn't fit anywhere this round
-            block, edge, flow, bbox, fraction = result
+            block, edge, flow, bbox, fraction, word_mobjs = result
             pool.add(*_outer_edges(bbox, parent_facing=edge.facing))
             occupied.append(bbox)
-            placed.append(PlacedBlock(block, edge.facing, flow, bbox, fraction))
+            placed.append(PlacedBlock(block, edge.facing, flow, bbox,
+                                      fraction, word_mobjs))
 
         return placed
 
@@ -190,15 +192,15 @@ class PosterBuilder:
 
             # Shrink the fraction until the block clears all occupied boxes.
             while fraction >= self._min_fraction:
-                block = self._fill(words, edge.facing, flow,
-                                   fraction * edge.length, self._color,
-                                   self._aspect)
+                block, word_mobjs = self._fill(
+                    words, edge.facing, flow, fraction * edge.length,
+                    self._color, self._aspect)
                 bbox = _place_on_edge(block, edge, self._buff)
                 if not _collides(bbox, occupied):
                     # success: put unused edges back so they remain available
                     for e in tried:
                         pool.add(e)
-                    return block, edge, flow, bbox, fraction
+                    return block, edge, flow, bbox, fraction, word_mobjs
                 fraction *= self._shrink_step
 
             tried.append(edge)             # this edge never fit; set aside

@@ -31,9 +31,29 @@ def make_aspect_fn() -> AspectFn:
     return aspect_of
 
 
+def _word_part(phrase: str, color: str) -> tuple[VGroup, list[Text]]:
+    """Build a part as a row of INDIVIDUAL word mobjects (addressable per word).
+
+    The words are laid out left-to-right with a small space so the part reads the
+    same as a single Text, but each word stays a separate mobject so the scene
+    can reveal them one at a time. Returns (part_group, word_mobjs).
+    """
+    word_strs = phrase.split()
+    # space width ≈ a fraction of a word's height, for natural spacing
+    sample = Text(word_strs[0], color=color)
+    space = sample.height * 0.32
+    word_mobjs = [sample] + [Text(w, color=color) for w in word_strs[1:]]
+    part = VGroup(*word_mobjs).arrange(RIGHT, buff=space, aligned_edge=DOWN)
+    return part, word_mobjs
+
+
 def fill_side(words: list[str], side: Side, flow: Flow, edge_len: float,
-              color: str, aspect_of: AspectFn) -> VGroup:
-    """Build a VGroup that fills `side` (length `edge_len`) per (side, flow).
+              color: str, aspect_of: AspectFn) -> tuple[VGroup, list[Text]]:
+    """Build a block filling `side` (length `edge_len`) per (side, flow).
+
+    Each part is composed of INDIVIDUAL word mobjects so words can be revealed
+    one at a time in sync with their timestamps. Returns (block, word_mobjs)
+    where word_mobjs is the flat list of every word's mobject in reading order.
 
     PARALLEL: each part scaled so its along-edge extent == edge_len; tiled
               across the free axis.
@@ -41,33 +61,35 @@ def fill_side(words: list[str], side: Side, flow: Flow, edge_len: float,
               stack == edge_len; each extends freely outward.
     """
     rot = _ROT[flow]
+    word_mobjs: list[Text] = []
 
     if is_parallel(side, flow):
         res = optimize_parallel(words, edge_len, aspect_of)
-        mobjs = []
-        for part in res.parts:
-            t = Text(part, color=color)
+        parts = []
+        for phrase in res.parts:
+            part, pwords = _word_part(phrase, color)
             if rot:
-                t.rotate(rot)
-            # along-edge axis is height for a vertical edge, width for horizontal
-            extent = t.height if side.is_vertical_edge else t.width
+                part.rotate(rot)
+            extent = part.height if side.is_vertical_edge else part.width
             if extent > 0:
-                t.scale(edge_len / extent)
-            mobjs.append(t)
-        # tile across the FREE axis
+                part.scale(edge_len / extent)
+            parts.append(part)
+            word_mobjs.extend(pwords)
         direction = RIGHT if side.is_vertical_edge else DOWN
-        return VGroup(*mobjs).arrange(direction, buff=res.gap)
+        block = VGroup(*parts).arrange(direction, buff=res.gap)
+        return block, word_mobjs
 
     # perpendicular
     res = optimize_perpendicular(words, edge_len, aspect_of)
-    mobjs = []
-    for part in res.parts:
-        t = Text(part, color=color)
-        if t.height > 0:
-            t.scale(res.band / t.height)   # free-axis size == band (pre-rotation)
+    parts = []
+    for phrase in res.parts:
+        part, pwords = _word_part(phrase, color)
+        if part.height > 0:
+            part.scale(res.band / part.height)   # free-axis == band (pre-rotate)
         if rot:
-            t.rotate(rot)
-        mobjs.append(t)
-    # tile ALONG the edge
+            part.rotate(rot)
+        parts.append(part)
+        word_mobjs.extend(pwords)
     direction = DOWN if side.is_vertical_edge else RIGHT
-    return VGroup(*mobjs).arrange(direction, buff=res.gap)
+    block = VGroup(*parts).arrange(direction, buff=res.gap)
+    return block, word_mobjs
