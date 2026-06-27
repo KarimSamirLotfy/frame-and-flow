@@ -21,8 +21,11 @@ from __future__ import annotations
 import os
 import random
 
+import numpy as np
 from manim import (
     DOWN,
+    ORIGIN,
+    PI,
     RIGHT,
     MovingCameraScene,
     Rectangle,
@@ -32,6 +35,7 @@ from manim import (
 )
 
 from layout import (
+    Flow,
     PosterBuilder,
     RangeFractionPicker,
     Side,
@@ -114,33 +118,51 @@ class SongPoster(MovingCameraScene):
                 self.wait(dt)
                 clock = t
 
-        def glide_to(target, line_start: float) -> None:
-            """Ease the camera to frame `target`; consumes up to the line's lead."""
-            nonlocal clock
-            cx, cy, w, h = self._frame_for(target)
-            lead = max(0.0, line_start - clock)         # time available before words
-            run = min(CAM_MAX_GLIDE, max(CAM_MIN_GLIDE, lead))
-            # don't overshoot the line start; if no lead, do a quick eased move
-            run = min(run, lead) if lead > 1e-3 else CAM_MIN_GLIDE
-            self.play(
-                self.camera.frame.animate.move_to([cx, cy, 0]).set(width=w),
-                run_time=max(run, 1e-2), rate_func=smooth,
-            )
-            clock += run
+        # Camera can't rotate in v0.20.1, so we ROTATE THE WORLD instead: spin
+        # `whole` so the target line becomes horizontal, then pan/zoom to it.
+        # `world_angle` is the current accumulated rotation of the composition.
+        world_angle = 0.0
 
-        # Start framed on the anchor, then reveal it.
-        cx, cy, w, h = self._frame_for(anchor)
+        def glide_to(target, target_text_angle: float, line_start: float) -> None:
+            """Rotate world so the line is upright + pan/zoom to it (eased)."""
+            nonlocal clock, world_angle
+            # After rotating the world by `delta`, the line's text angle becomes
+            # (target_text_angle + world_angle + delta); we want that == 0.
+            delta = -(target_text_angle + world_angle)
+            new_world_angle = world_angle + delta
+
+            lead = max(0.0, line_start - clock)
+            run = min(run_glide(lead), lead) if lead > 1e-3 else CAM_MIN_GLIDE
+            run = max(run, 1e-2)
+
+            anims = []
+            if abs(delta) > 1e-4:
+                anims.append(whole.animate.rotate(delta, about_point=ORIGIN))
+            # Predict where `target` will be AFTER the world rotation, to frame it.
+            cx, cy, w, _ = self._frame_for_rotated(target, delta)
+            anims.append(self.camera.frame.animate.move_to([cx, cy, 0]).set(width=w))
+
+            self.play(*anims, run_time=run, rate_func=smooth)
+            clock += run
+            world_angle = new_world_angle
+
+        def run_glide(lead: float) -> float:
+            return min(CAM_MAX_GLIDE, max(CAM_MIN_GLIDE, lead))
+
+        # Start framed on the anchor (always horizontal), then reveal it.
+        cx, cy, w, _ = self._frame_for(anchor)
         self.camera.frame.move_to([cx, cy, 0]).set(width=w)
         advance_to(first.start)
         self._reveal_words(first, anchor_words, end, advance_to)
         if SHOW_DEBUG:
             self._outline(anchor, ANCHOR_BOX)
 
-        # Then every other line: glide to it, then reveal its words.
+        # Then every other line: rotate-world + glide to it, then reveal words.
         for line, p in zip(song.lyrics[1:upto], placed):
             if line.start >= end:
                 break
-            glide_to(p.block, line.start)
+            text_angle = (PI / 2) if p.flow is Flow.VERTICAL else 0.0
+            glide_to(p.block, text_angle, line.start)
             advance_to(line.start)
             self._reveal_words(line, p.word_mobjs, end, advance_to)
             if SHOW_DEBUG:
@@ -177,14 +199,35 @@ class SongPoster(MovingCameraScene):
         Respects the frame's aspect ratio (so the line fits on BOTH axes) and a
         minimum width so tiny lines don't zoom in absurdly far.
         """
+        return self._frame_dims(mob.width, mob.height, mob.get_center())
+
+    def _frame_for_rotated(self, mob, delta: float
+                           ) -> tuple[float, float, float, float]:
+        """Frame `mob` as it will appear AFTER the world rotates by `delta`.
+
+        The world rotates about ORIGIN, so the line's center moves; its on-screen
+        size after rotation is the line's own width/height rotated upright. Since
+        we only ever rotate to make the line axis-aligned, the post-rotation
+        footprint is the line's current (pre-rotation) extent along its own axes.
+        """
+        c = mob.get_center()
+        # rotate the center about ORIGIN by delta
+        cos, sin = np.cos(delta), np.sin(delta)
+        rx = c[0] * cos - c[1] * sin
+        ry = c[0] * sin + c[1] * cos
+        # after rotation the line is axis-aligned; use its bounding extent.
+        w_axis = max(mob.width, mob.height)   # the long (reading) axis
+        h_axis = min(mob.width, mob.height)
+        return self._frame_dims(w_axis, h_axis, [rx, ry, 0])
+
+    def _frame_dims(self, content_w: float, content_h: float, center
+                    ) -> tuple[float, float, float, float]:
         aspect = self.camera.frame.width / self.camera.frame.height
-        need_w = mob.width + 2 * CAM_MARGIN
-        need_h = mob.height + 2 * CAM_MARGIN
-        # width must cover both the horizontal need and the height*aspect need
+        need_w = content_w + 2 * CAM_MARGIN
+        need_h = content_h + 2 * CAM_MARGIN
         w = max(need_w, need_h * aspect, CAM_MIN_W)
         h = w / aspect
-        c = mob.get_center()
-        return c[0], c[1], w, h
+        return center[0], center[1], w, h
 
     # ------------------------------------------------------------------- #
     def _outline(self, mob, color: str) -> None:
