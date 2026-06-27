@@ -66,8 +66,11 @@ SIDE_COLOR = {
 }
 
 # Camera framing
-CAM_MARGIN = 1.6      # extra world-units of padding around the framed line
-# no zoom-in floor: the camera frames each line + margin exactly, however small
+# Margin is MULTIPLICATIVE (a fraction of the line size), not a fixed number of
+# world-units — a fixed margin dwarfs small lines and acts as a hidden zoom-in
+# floor. PAD=0.18 means the line fills ~1/(1.18) ≈ 85% of the frame on its
+# tight axis, at every scale.
+CAM_PAD = 0.18       # frame = line * (1 + CAM_PAD), so the line dominates always
 CAM_MAX_GLIDE = 1.1  # longest a single camera glide takes (seconds)
 CAM_MIN_GLIDE = 0.35 # shortest glide, so motion always reads as eased
 
@@ -253,9 +256,11 @@ class SongPoster(MovingCameraScene):
     def _frame_dims(self, content_w: float, content_h: float, center
                     ) -> tuple[float, float, float, float]:
         aspect = self.camera.frame.width / self.camera.frame.height
-        need_w = content_w + 2 * CAM_MARGIN
-        need_h = content_h + 2 * CAM_MARGIN
-        w = max(need_w, need_h * aspect)   # fit both axes; no zoom-in floor
+        # Multiplicative padding so the line always fills the same fraction of
+        # the frame, regardless of its absolute size (no hidden zoom floor).
+        need_w = content_w * (1 + CAM_PAD)
+        need_h = content_h * (1 + CAM_PAD)
+        w = max(need_w, need_h * aspect)   # fit on both axes
         h = w / aspect
         return center[0], center[1], w, h
 
