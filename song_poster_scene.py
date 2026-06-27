@@ -1,17 +1,19 @@
-"""Render the whole song as one build-up canvas (test view, no camera yet).
+"""Render the whole song as a build-up canvas with a moving camera.
 
-Every lyric line is chained onto the growing shape via the `layout` engine:
-sides are pseudo-random (biased right/down), flow is pseudo-random per line.
-This is a static test of how the full song lays out; camera framing comes later.
+Every lyric line is chained onto a growing shape via the `layout` engine (edge
+tree). Words pop in at their per-word timestamps, and the CAMERA glides+zooms to
+frame the whole current lyric line as it is sung, with eased (non-linear) motion.
 
 Render:
-    uv run manim -ql -s song_poster_scene.py SongPoster        # single frame
-    uv run manim -ql   song_poster_scene.py SongPoster         # timed reveal
+    uv run manim -ql   song_poster_scene.py SongPoster         # the video
+    uv run manim -ql -s song_poster_scene.py SongPoster        # final frame
 
 Env:
     HACKATUNE_SONG   song JSON     (default data/songs/song_666407.json)
     HACKATUNE_SEED   RNG seed      (default 7)
     HACKATUNE_END    stop after N lyric seconds; 0 = full song (default 0)
+    HACKATUNE_NLINES lines to lay out; 0 = whole song          (default 0)
+    HACKATUNE_DEBUG  1 = draw block outlines                   (default 0)
 """
 
 from __future__ import annotations
@@ -19,7 +21,15 @@ from __future__ import annotations
 import os
 import random
 
-from manim import DOWN, RIGHT, Rectangle, Scene, Text, VGroup
+from manim import (
+    DOWN,
+    RIGHT,
+    MovingCameraScene,
+    Rectangle,
+    Text,
+    VGroup,
+    smooth,
+)
 
 from layout import (
     PosterBuilder,
@@ -50,8 +60,14 @@ SIDE_COLOR = {
     Side.UP: "#cc66ff",
 }
 
+# Camera framing
+CAM_MARGIN = 1.6      # extra world-units of padding around the framed line
+CAM_MIN_W = 6.0      # don't zoom in tighter than this frame width (tiny lines)
+CAM_MAX_GLIDE = 1.1  # longest a single camera glide takes (seconds)
+CAM_MIN_GLIDE = 0.35 # shortest glide, so motion always reads as eased
 
-class SongPoster(Scene):
+
+class SongPoster(MovingCameraScene):
     def construct(self) -> None:
         song = Song.load(SONG_PATH)
         end = END_TIME if END_TIME > 0 else song.duration
@@ -85,9 +101,10 @@ class SongPoster(Scene):
         for p in placed:
             p.block.set_color(ACTIVE)
 
-        # ---- timed build-up ---------------------------------------------- #
-        # The anchor (line 0) is shown at line 0's start; every other line's
-        # block pops in bright exactly at its own start time, and stays.
+        # ---- timed build-up with moving camera --------------------------- #
+        # Per line: glide the camera to frame the whole line (eased), then pop in
+        # its words at their timestamps. The camera glide consumes real timeline
+        # time, tracked by the clock so word reveals stay in sync.
         clock = 0.0
 
         def advance_to(t: float) -> None:
@@ -97,16 +114,34 @@ class SongPoster(Scene):
                 self.wait(dt)
                 clock = t
 
-        # Words pop in INDIVIDUALLY at their own timestamps (karaoke build-up).
-        # Anchor first:
+        def glide_to(target, line_start: float) -> None:
+            """Ease the camera to frame `target`; consumes up to the line's lead."""
+            nonlocal clock
+            cx, cy, w, h = self._frame_for(target)
+            lead = max(0.0, line_start - clock)         # time available before words
+            run = min(CAM_MAX_GLIDE, max(CAM_MIN_GLIDE, lead))
+            # don't overshoot the line start; if no lead, do a quick eased move
+            run = min(run, lead) if lead > 1e-3 else CAM_MIN_GLIDE
+            self.play(
+                self.camera.frame.animate.move_to([cx, cy, 0]).set(width=w),
+                run_time=max(run, 1e-2), rate_func=smooth,
+            )
+            clock += run
+
+        # Start framed on the anchor, then reveal it.
+        cx, cy, w, h = self._frame_for(anchor)
+        self.camera.frame.move_to([cx, cy, 0]).set(width=w)
+        advance_to(first.start)
         self._reveal_words(first, anchor_words, end, advance_to)
         if SHOW_DEBUG:
             self._outline(anchor, ANCHOR_BOX)
 
-        # Then every other line, word by word, in its block:
+        # Then every other line: glide to it, then reveal its words.
         for line, p in zip(song.lyrics[1:upto], placed):
             if line.start >= end:
                 break
+            glide_to(p.block, line.start)
+            advance_to(line.start)
             self._reveal_words(line, p.word_mobjs, end, advance_to)
             if SHOW_DEBUG:
                 self._outline(p.block, SIDE_COLOR[p.side])
@@ -134,6 +169,22 @@ class SongPoster(Scene):
         # is silently dropped
         for j in range(n, len(word_mobjs)):
             self.add(word_mobjs[j])
+
+    # ------------------------------------------------------------------- #
+    def _frame_for(self, mob) -> tuple[float, float, float, float]:
+        """Camera (cx, cy, width, height) that frames `mob` with margin.
+
+        Respects the frame's aspect ratio (so the line fits on BOTH axes) and a
+        minimum width so tiny lines don't zoom in absurdly far.
+        """
+        aspect = self.camera.frame.width / self.camera.frame.height
+        need_w = mob.width + 2 * CAM_MARGIN
+        need_h = mob.height + 2 * CAM_MARGIN
+        # width must cover both the horizontal need and the height*aspect need
+        w = max(need_w, need_h * aspect, CAM_MIN_W)
+        h = w / aspect
+        c = mob.get_center()
+        return c[0], c[1], w, h
 
     # ------------------------------------------------------------------- #
     def _outline(self, mob, color: str) -> None:
