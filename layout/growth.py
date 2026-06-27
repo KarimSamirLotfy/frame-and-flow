@@ -138,6 +138,9 @@ class PosterBuilder:
         side_weights: dict[Side, float] | None = None,
         attach_buff: float = 0.16,
         color: str = "#46464f",
+        shrink_step: float = 0.85,    # multiply fraction by this when it collides
+        min_fraction: float = 0.12,   # don't shrink below this; try another edge
+        max_edge_tries: int = 8,      # candidate edges to try before skipping line
     ) -> None:
         self._fill = fill
         self._aspect = aspect_of
@@ -146,33 +149,63 @@ class PosterBuilder:
         self._weights = side_weights or DEFAULT_SIDE_WEIGHTS
         self._buff = attach_buff
         self._color = color
+        self._shrink_step = shrink_step
+        self._min_fraction = min_fraction
+        self._max_edge_tries = max_edge_tries
 
     def build(self, anchor: VGroup, lines: list[list[str]],
               rng: random.Random) -> list[PlacedBlock]:
-        """Place each line onto the growing edge tree seeded by `anchor`."""
+        """Place each line onto the growing edge tree seeded by `anchor`.
+
+        For each line we pick an edge and SHRINK its fill fraction until the
+        resulting block clears every block placed so far (no overlaps). If it
+        won't fit on that edge even at `min_fraction`, we try another edge.
+        """
         abox = _mobj_bbox(anchor)
-        pool = EdgePool(_edges_of(abox))   # anchor seeds all 4 of its edges
+        pool = EdgePool(_edges_of(abox))
         placed: list[PlacedBlock] = []
+        occupied: list[BBox] = [abox]      # everything already on the canvas
 
         for words in lines:
-            if len(pool) == 0:
-                break
-
-            edge = pool.pop_weighted(self._weights, rng)
-            flow = self._pick_flow(rng)
-            fraction = self._pick_fraction(rng)
-
-            target = fraction * edge.length
-            block = self._fill(words, edge.facing, flow, target, self._color,
-                               self._aspect)
-
-            bbox = _place_on_edge(block, edge, self._buff)
-
-            # Expose the block's 3 OUTER edges (all but the one facing the parent).
+            result = self._place_one(words, pool, occupied, rng)
+            if result is None:
+                continue                   # couldn't fit anywhere this round
+            block, edge, flow, bbox, fraction = result
             pool.add(*_outer_edges(bbox, parent_facing=edge.facing))
+            occupied.append(bbox)
             placed.append(PlacedBlock(block, edge.facing, flow, bbox, fraction))
 
         return placed
+
+    def _place_one(self, words, pool, occupied, rng):
+        """Try edges, shrinking fraction to fit. Returns placement or None."""
+        flow = self._pick_flow(rng)
+        tried: list[Edge] = []
+
+        for _ in range(self._max_edge_tries):
+            if len(pool) == 0:
+                break
+            edge = pool.pop_weighted(self._weights, rng)
+            fraction = self._pick_fraction(rng)
+
+            # Shrink the fraction until the block clears all occupied boxes.
+            while fraction >= self._min_fraction:
+                block = self._fill(words, edge.facing, flow,
+                                   fraction * edge.length, self._color,
+                                   self._aspect)
+                bbox = _place_on_edge(block, edge, self._buff)
+                if not _collides(bbox, occupied):
+                    # success: put unused edges back so they remain available
+                    for e in tried:
+                        pool.add(e)
+                    return block, edge, flow, bbox, fraction
+                fraction *= self._shrink_step
+
+            tried.append(edge)             # this edge never fit; set aside
+
+        for e in tried:                    # restore edges we set aside
+            pool.add(e)
+        return None
 
 
 # --------------------------------------------------------------------------- #
@@ -182,6 +215,15 @@ def _mobj_bbox(mob) -> BBox:
     c = mob.get_center()
     w, h = mob.width, mob.height
     return BBox(c[0] - w / 2, c[1] - h / 2, c[0] + w / 2, c[1] + h / 2)
+
+
+def _collides(box: BBox, others: list[BBox], eps: float = 0.02) -> bool:
+    """True if `box` overlaps any box in `others` (with a small tolerance)."""
+    for o in others:
+        if (box.x0 < o.x1 - eps and o.x0 < box.x1 - eps and
+                box.y0 < o.y1 - eps and o.y0 < box.y1 - eps):
+            return True
+    return False
 
 
 def _edges_of(box: BBox) -> list[Edge]:
