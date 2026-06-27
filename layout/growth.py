@@ -101,27 +101,40 @@ class PlacedBlock:
     fraction: float          # how much of the edge this line filled
 
 
-class SideSpans:
-    """Tracks how much of each side's outer edge is already consumed.
+@dataclass
+class Shelf:
+    """An open packing shelf along one side.
 
-    Partial blocks pack from a side's START corner. `used[side]` is the length
-    already taken along that side since it was last reset. When the bounding box
-    GROWS on an axis, the perpendicular sides' edges lengthen, so we keep packing
-    where we left off; we only reset a side's usage when the bbox edge it packs
-    against shifts outward (a block was placed ON that side).
+    `outer`    fixed coordinate of the side's outer edge (x for L/R, y for U/D),
+               captured when the shelf opened — every block on the shelf shares
+               this edge line instead of marching outward as the bbox grows.
+    `start`    fixed start-corner coordinate ALONG the edge (top for L/R, left
+               for U/D), so packing offsets stay anchored even as the bbox grows.
+    `edge_len` the edge length when the shelf opened (target fractions use this,
+               so all blocks on the shelf size against the same edge).
+    `offset`   distance already packed along the edge from `start`.
     """
 
+    outer: float
+    start: float
+    edge_len: float
+    offset: float = 0.0
+
+
+class ShelfBook:
+    """Per-side open shelves. A shelf opens on first use and reopens when full."""
+
     def __init__(self) -> None:
-        self._used: dict[Side, float] = {s: 0.0 for s in Side}
+        self._shelves: dict[Side, Shelf | None] = {s: None for s in Side}
 
-    def used(self, side: Side) -> float:
-        return self._used[side]
+    def get(self, side: Side) -> Shelf | None:
+        return self._shelves[side]
 
-    def consume(self, side: Side, length: float) -> None:
-        self._used[side] += length
-
-    def reset(self, side: Side) -> None:
-        self._used[side] = 0.0
+    def open(self, side: Side, outer: float, start: float,
+             edge_len: float) -> Shelf:
+        shelf = Shelf(outer=outer, start=start, edge_len=edge_len)
+        self._shelves[side] = shelf
+        return shelf
 
 
 class PosterBuilder:
@@ -152,39 +165,40 @@ class PosterBuilder:
               rng: random.Random) -> list[PlacedBlock]:
         """Place each line around `anchor`. Returns the placed blocks in order."""
         bbox = _mobj_bbox(anchor)
-        spans = SideSpans()
+        book = ShelfBook()
         placed: list[PlacedBlock] = []
 
         for idx, words in enumerate(lines):
             side = self._pick_side(rng)
             flow = self._pick_flow(rng)
 
-            # First few lines fill fully; the rest fill a fraction (70-100%) so
-            # the canvas grows roughly linearly instead of exponentially.
             full = idx < self._full_fill_first
             fraction = 1.0 if full else self._pick_fraction(rng)
 
-            edge_len = bbox.edge_length(side)
-            # A full-fill block resets the side and uses the whole edge; a
-            # partial block fills `fraction` of the *remaining* free edge.
-            if full:
-                spans.reset(side)
-                target = edge_len
-                offset = 0.0
-            else:
-                free = max(0.0, edge_len - spans.used(side))
-                if free < 0.15 * edge_len:        # side nearly full -> reset
-                    spans.reset(side)
-                    free = edge_len
-                target = fraction * free
-                offset = spans.used(side)
+            # Find or open the shelf for this side. A shelf shares ONE fixed
+            # outer edge + start corner + edge_len so same-side blocks pack ALONG
+            # it (perpendicular to the growth axis), each sized against the same
+            # edge. We reopen only on a full-fill or when the shelf is full.
+            shelf = book.get(side)
+            need_target = fraction * bbox.edge_length(side)
+            if full or shelf is None or shelf.offset + need_target > \
+                    shelf.edge_len + 1e-6:
+                shelf = book.open(
+                    side,
+                    outer=_outer_coord(bbox, side),
+                    start=_start_coord(bbox, side),
+                    edge_len=bbox.edge_length(side),
+                )
+
+            # Fraction is OF THE SHELF'S EDGE, packed from its start corner.
+            target = shelf.edge_len if full else fraction * shelf.edge_len
 
             block = self._fill(words, side, flow, target, self._color,
                                self._aspect)
-            _attach_outside(block, bbox, side, self._buff, offset)
+            _place_on_shelf(block, side, shelf, self._buff)
 
             along = block.height if side.is_vertical_edge else block.width
-            spans.consume(side, along + self._buff)
+            shelf.offset += along + self._buff
 
             block_bbox = _mobj_bbox(block)
             bbox = bbox.union(block_bbox)
@@ -202,32 +216,35 @@ def _mobj_bbox(mob) -> BBox:
     return BBox(c[0] - w / 2, c[1] - h / 2, c[0] + w / 2, c[1] + h / 2)
 
 
-def _attach_outside(block: VGroup, bbox: BBox, side: Side, buff: float,
-                    offset: float = 0.0) -> None:
-    """Place `block` flush OUTSIDE `bbox` on `side`, packed from the start corner.
+def _outer_coord(bbox: BBox, side: Side) -> float:
+    """The coordinate of `side`'s outer edge (x for L/R, y for U/D)."""
+    return {
+        Side.RIGHT: bbox.x1, Side.LEFT: bbox.x0,
+        Side.UP: bbox.y1, Side.DOWN: bbox.y0,
+    }[side]
 
-    `offset` is how far along the edge (from its start corner) the block begins,
-    so partial blocks pack sequentially without overlap. Placing the block fully
-    beyond the bbox edge guarantees it can't overlap the interior.
 
-    Start corners per side (packing direction):
-        RIGHT / LEFT  -> pack DOWNWARD from the top edge
-        UP / DOWN     -> pack RIGHTWARD from the left edge
+def _start_coord(bbox: BBox, side: Side) -> float:
+    """Start-corner coordinate ALONG the edge: top for L/R, left for U/D."""
+    return bbox.y1 if side.is_vertical_edge else bbox.x0
+
+
+def _place_on_shelf(block: VGroup, side: Side, shelf, buff: float) -> None:
+    """Place `block` on `side`'s shelf: fixed outer edge, packed along from start.
+
+    All coordinates come from the SHELF (captured when it opened), so same-side
+    blocks share one outer edge line and one start corner — they pack ALONG the
+    edge (perpendicular to the growth axis) without marching outward. Packing:
+        RIGHT / LEFT  -> downward from the top corner
+        UP   / DOWN   -> rightward from the left corner
     """
     bw, bh = block.width, block.height
+    off = shelf.offset
     if side is Side.RIGHT:
-        x = bbox.x1 + buff + bw / 2
-        y = bbox.y1 - offset - bh / 2        # from top, downward
-        block.move_to([x, y, 0])
+        block.move_to([shelf.outer + buff + bw / 2, shelf.start - off - bh / 2, 0])
     elif side is Side.LEFT:
-        x = bbox.x0 - buff - bw / 2
-        y = bbox.y1 - offset - bh / 2        # from top, downward
-        block.move_to([x, y, 0])
+        block.move_to([shelf.outer - buff - bw / 2, shelf.start - off - bh / 2, 0])
     elif side is Side.UP:
-        x = bbox.x0 + offset + bw / 2        # from left, rightward
-        y = bbox.y1 + buff + bh / 2
-        block.move_to([x, y, 0])
+        block.move_to([shelf.start + off + bw / 2, shelf.outer + buff + bh / 2, 0])
     else:  # DOWN
-        x = bbox.x0 + offset + bw / 2        # from left, rightward
-        y = bbox.y0 - buff - bh / 2
-        block.move_to([x, y, 0])
+        block.move_to([shelf.start + off + bw / 2, shelf.outer - buff - bh / 2, 0])
