@@ -25,7 +25,7 @@ import random
 
 from manim import Rectangle, Scene, Text, VGroup, config
 
-from grid import subdivide
+from grid import row_major
 from song_data import LyricLine, Song
 
 # --------------------------------------------------------------------------- #
@@ -96,7 +96,7 @@ class GridScene(Scene):
     ) -> tuple[VGroup, list[Text]]:
         """Build a random mosaic for one line: one word per cell, all dim."""
         rng = random.Random(seed)
-        cells = subdivide(area_w, area_h, len(line.words), rng, gutter=GUTTER)
+        cells = row_major(area_w, area_h, len(line.words), rng, gutter=GUTTER)
 
         layout = VGroup()
         word_mobjs: list[Text] = []
