@@ -70,11 +70,14 @@ SIDE_COLOR = {
 }
 
 # Camera framing
-# Margin is MULTIPLICATIVE (a fraction of the line size), not a fixed number of
-# world-units — a fixed margin dwarfs small lines and acts as a hidden zoom-in
-# floor. PAD=0.18 means the line fills ~1/(1.18) ≈ 85% of the frame on its
-# tight axis, at every scale.
-CAM_PAD = 0.18       # frame = line * (1 + CAM_PAD), so the line dominates always
+# Readability-first: we zoom so the line's TEXT renders at a target pixel size
+# (typography rule: 1080p body kinetic text ~48-64px, never below ~36px), rather
+# than sizing the frame to contain the whole block. Wide lines may then extend
+# past the frame edges — that's the accepted trade for legibility.
+TARGET_GLYPH_PX = 90     # desired on-screen glyph height at 1080p
+MIN_GLYPH_PX = 48        # never let text be smaller than this
+CAM_PAD = 0.18           # small breathing room when the block is the limiter
+RENDER_H_PX = 1080       # reference render height the px targets assume
 CAM_MAX_GLIDE = 1.1  # longest a single camera glide takes (seconds)
 CAM_MIN_GLIDE = 0.35 # shortest glide, so motion always reads as eased
 
@@ -144,7 +147,8 @@ class SongPoster(MovingCameraScene):
         # `world_angle` is the current accumulated rotation of the composition.
         world_angle = 0.0
 
-        def glide_to(target, target_text_angle: float, line_start: float) -> None:
+        def glide_to(target, word_mobjs, target_text_angle: float,
+                     line_start: float) -> None:
             """Rotate world so the line is upright + pan/zoom to it (eased).
 
             IMPORTANT: we must NOT do `whole.animate.rotate(...)` — animating the
@@ -161,7 +165,7 @@ class SongPoster(MovingCameraScene):
             run = min(run_glide(lead), lead) if lead > 1e-3 else CAM_MIN_GLIDE
             run = max(run, 1e-2)
 
-            cx, cy, w, _ = self._frame_for_rotated(target, delta)
+            cx, cy, w, _ = self._frame_for_rotated(target, word_mobjs, delta)
 
             if not rendering():
                 # fast-forward: apply the END state of the glide instantly.
@@ -202,7 +206,7 @@ class SongPoster(MovingCameraScene):
             return min(CAM_MAX_GLIDE, max(CAM_MIN_GLIDE, lead))
 
         # Start framed on the anchor (always horizontal), then reveal it.
-        cx, cy, w, _ = self._frame_for(anchor)
+        cx, cy, w, _ = self._frame_for(anchor, anchor_words)
         self.camera.frame.move_to([cx, cy, 0]).set(width=w)
         advance_to(first.start)
         self._reveal_words(first, anchor_words, end, advance_to)
@@ -214,7 +218,7 @@ class SongPoster(MovingCameraScene):
             if line.start >= end:
                 break
             text_angle = (PI / 2) if p.flow is Flow.VERTICAL else 0.0
-            glide_to(p.block, text_angle, line.start)
+            glide_to(p.block, p.word_mobjs, text_angle, line.start)
             advance_to(line.start)
             self._reveal_words(line, p.word_mobjs, end, advance_to)
             if SHOW_DEBUG:
@@ -244,41 +248,63 @@ class SongPoster(MovingCameraScene):
             word_mobjs[j].set_opacity(1.0)
 
     # ------------------------------------------------------------------- #
-    def _frame_for(self, mob) -> tuple[float, float, float, float]:
-        """Camera (cx, cy, width, height) that frames `mob` with margin.
+    @staticmethod
+    def _glyph_h(word_mobjs) -> float:
+        """A representative glyph height (world units): the tallest word.
 
-        Respects the frame's aspect ratio (so the line fits on BOTH axes) and a
-        minimum width so tiny lines don't zoom in absurdly far.
+        Tallest, not first, so the readability target is met by every word in
+        the line (the biggest word is the limiter once we hit a px target).
         """
-        return self._frame_dims(mob.width, mob.height, mob.get_center())
+        if not word_mobjs:
+            return 0.5
+        # word mobjs may be rotated; their on-screen text height is min(w, h)
+        return max(min(w.width, w.height) for w in word_mobjs) or 0.5
 
-    def _frame_for_rotated(self, mob, delta: float
+    def _frame_for(self, mob, word_mobjs) -> tuple[float, float, float, float]:
+        """Frame `mob` so its glyphs hit the target px size (readability-first)."""
+        return self._frame_dims(mob.width, mob.height,
+                                self._glyph_h(word_mobjs), mob.get_center())
+
+    def _frame_for_rotated(self, mob, word_mobjs, delta: float
                            ) -> tuple[float, float, float, float]:
-        """Frame `mob` as it will appear AFTER the world rotates by `delta`.
-
-        The world rotates about ORIGIN, so the line's center moves; its on-screen
-        size after rotation is the line's own width/height rotated upright. Since
-        we only ever rotate to make the line axis-aligned, the post-rotation
-        footprint is the line's current (pre-rotation) extent along its own axes.
-        """
+        """Frame `mob` after the world rotates by `delta`, readability-first."""
         c = mob.get_center()
-        # rotate the center about ORIGIN by delta
         cos, sin = np.cos(delta), np.sin(delta)
         rx = c[0] * cos - c[1] * sin
         ry = c[0] * sin + c[1] * cos
-        # after rotation the line is axis-aligned; use its bounding extent.
-        w_axis = max(mob.width, mob.height)   # the long (reading) axis
+        w_axis = max(mob.width, mob.height)   # long (reading) axis after upright
         h_axis = min(mob.width, mob.height)
-        return self._frame_dims(w_axis, h_axis, [rx, ry, 0])
+        return self._frame_dims(w_axis, h_axis,
+                                self._glyph_h(word_mobjs), [rx, ry, 0])
 
-    def _frame_dims(self, content_w: float, content_h: float, center
+    def _frame_dims(self, content_w: float, content_h: float,
+                    glyph_h: float, center
                     ) -> tuple[float, float, float, float]:
         aspect = self.camera.frame.width / self.camera.frame.height
-        # Multiplicative padding so the line always fills the same fraction of
-        # the frame, regardless of its absolute size (no hidden zoom floor).
+
+        # --- readability target: pick frame width so glyphs hit TARGET_GLYPH_PX
+        # px = glyph_world_h * (RENDER_H_PX / frame_height_world)
+        #    = glyph_world_h * RENDER_H_PX * aspect / frame_width
+        # => frame_width = glyph_world_h * RENDER_H_PX * aspect / target_px
+        def width_for_px(px: float) -> float:
+            if glyph_h <= 0 or px <= 0:
+                return 1.0
+            return glyph_h * RENDER_H_PX * aspect / px
+
+        w_target = width_for_px(TARGET_GLYPH_PX)   # the size we'd LIKE
+        w_floor = width_for_px(MIN_GLYPH_PX)        # the largest frame still legible
+
+        # --- containment: the frame the whole block would need (with padding)
         need_w = content_w * (1 + CAM_PAD)
         need_h = content_h * (1 + CAM_PAD)
-        w = max(need_w, need_h * aspect)   # fit on both axes
+        w_contain = max(need_w, need_h * aspect)
+
+        # Prefer to contain the block, but NEVER zoom out past the legibility
+        # floor: if containing the block would shrink text below MIN_GLYPH_PX,
+        # cap at w_floor (long lines then run off-frame, but stay readable).
+        # Also don't zoom in tighter than the nice target.
+        w = min(max(w_contain, w_target), w_floor) if w_floor >= w_target \
+            else w_target
         h = w / aspect
         return center[0], center[1], w, h
 
