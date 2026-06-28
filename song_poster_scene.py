@@ -41,6 +41,7 @@ from layout import (
     RangeFractionPicker,
     Side,
     WeightedFlowPicker,
+    WORD_ANIM_STYLES,
     fill_side,
     make_aspect_fn,
 )
@@ -78,6 +79,10 @@ TARGET_GLYPH_PX = 90     # desired on-screen glyph height at 1080p
 MIN_GLYPH_PX = 48        # never let text be smaller than this
 CAM_PAD = 0.18           # small breathing room when the block is the limiter
 RENDER_H_PX = 1080       # reference render height the px targets assume
+
+# Word entrance animation (see layout/animations.py STYLES)
+WORD_ANIM = os.environ.get("HACKATUNE_WORDANIM", "slide")  # "slide" | "pop"
+WORD_ANIM_RT = float(os.environ.get("HACKATUNE_WORDANIM_RT", "0.28"))
 CAM_MAX_GLIDE = 1.1  # longest a single camera glide takes (seconds)
 CAM_MIN_GLIDE = 0.35 # shortest glide, so motion always reads as eased
 
@@ -141,6 +146,11 @@ class SongPoster(MovingCameraScene):
                     self.wait(dt)        # real time, emits frames
                 # else: fast-forward, just advance the clock (no frames)
                 clock = t
+
+        def bump(dt: float) -> None:
+            """Advance the clock by `dt` already consumed by a self.play()."""
+            nonlocal clock
+            clock += dt
 
         # Camera can't rotate in v0.20.1, so we ROTATE THE WORLD instead: spin
         # `whole` so the target line becomes horizontal, then pan/zoom to it.
@@ -209,7 +219,9 @@ class SongPoster(MovingCameraScene):
         cx, cy, w, _ = self._frame_for(anchor, anchor_words)
         self.camera.frame.move_to([cx, cy, 0]).set(width=w)
         advance_to(first.start)
-        self._reveal_words(first, anchor_words, end, advance_to)
+        # anchor has no aligned edge; slide it up from below (Side.DOWN), no spin
+        self._reveal_words(first, anchor_words, Side.DOWN, 0.0, end,
+                           advance_to, rendering, bump)
         if SHOW_DEBUG:
             self._outline(anchor, ANCHOR_BOX)
 
@@ -220,7 +232,10 @@ class SongPoster(MovingCameraScene):
             text_angle = (PI / 2) if p.flow is Flow.VERTICAL else 0.0
             glide_to(p.block, p.word_mobjs, text_angle, line.start)
             advance_to(line.start)
-            self._reveal_words(line, p.word_mobjs, end, advance_to)
+            # use the LIVE accumulated world rotation so slide offsets are
+            # correct on screen (the world is spun to keep this line upright).
+            self._reveal_words(line, p.word_mobjs, p.side, world_angle, end,
+                               advance_to, rendering, bump)
             if SHOW_DEBUG:
                 self._outline(p.block, SIDE_COLOR[p.side])
 
@@ -228,23 +243,33 @@ class SongPoster(MovingCameraScene):
         self.wait(1.0)
 
     # ------------------------------------------------------------------- #
-    def _reveal_words(self, line, word_mobjs, end, advance_to) -> None:
-        """Add each word's mobject at the word's start time (per-word build-up).
+    def _reveal_words(self, line, word_mobjs, side, world_angle, end,
+                      advance_to, rendering, bump) -> None:
+        """Animate each word in at its start time (per-word build-up).
 
-        `line.words` carries per-word start times; `word_mobjs` is the matching
-        list in reading order. If counts differ (rare wrap edge case), we fall
-        back to spreading words evenly across the line's span.
+        Each word's entrance STARTS on its timestamp (slide begins at word.start
+        and settles ~WORD_ANIM_RT later). The play consumes run_time, which the
+        caller's clock accounts for via `advance_to`. While fast-forwarding
+        (before the render window), entrances are applied instantly.
         """
+        style = WORD_ANIM_STYLES.get(WORD_ANIM, WORD_ANIM_STYLES["pop"])
         words = line.words
         n = min(len(words), len(word_mobjs))
+
         for i in range(n):
             t = words[i].start
             if t >= end:
                 break
-            advance_to(t)
-            word_mobjs[i].set_opacity(1.0)        # reveal this word
-        # reveal any leftover mobjs (count mismatch) so nothing is dropped
-        for j in range(n, len(word_mobjs)):
+            advance_to(t)                       # reach this word's beat
+            wmob = word_mobjs[i]
+            if not rendering():
+                wmob.set_opacity(1.0)           # fast-forward: instant
+                continue
+            anim = style.build(wmob, side, world_angle, WORD_ANIM_RT)
+            self.play(anim)                     # starts on the beat, eases in
+            bump(WORD_ANIM_RT)                  # clock += time the play consumed
+
+        for j in range(n, len(word_mobjs)):     # leftovers (count mismatch)
             word_mobjs[j].set_opacity(1.0)
 
     # ------------------------------------------------------------------- #

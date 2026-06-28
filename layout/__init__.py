@@ -1,5 +1,6 @@
 """Build-up layout engine: chain lyric lines into a growing typographic shape."""
 
+from .animations import STYLES as WORD_ANIM_STYLES
 from .filler import fill_side, make_aspect_fn
 from .geometry import BBox, Flow, Side, is_parallel
 from .growth import (
@@ -14,4 +15,5 @@ __all__ = [
     "fill_side", "make_aspect_fn",
     "PosterBuilder", "PlacedBlock",
     "WeightedFlowPicker", "RangeFractionPicker",
+    "WORD_ANIM_STYLES",
 ]
