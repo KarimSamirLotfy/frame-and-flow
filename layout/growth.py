@@ -155,20 +155,25 @@ class PosterBuilder:
         self._max_edge_tries = max_edge_tries
 
     def build(self, anchor: VGroup, lines: list[list[str]],
-              rng: random.Random) -> list[PlacedBlock]:
+              rng: random.Random, make_words=None) -> list[PlacedBlock]:
         """Place each line onto the growing edge tree seeded by `anchor`.
 
         For each line we pick an edge and SHRINK its fill fraction until the
         resulting block clears every block placed so far (no overlaps). If it
         won't fit on that edge even at `min_fraction`, we try another edge.
+
+        `make_words`, if given, is a list parallel to `lines`: each entry is a
+        `make_word(text, index, color) -> Text` factory used for that line's
+        words (for per-word styling). None -> plain text for every line.
         """
         abox = _mobj_bbox(anchor)
         pool = EdgePool(_edges_of(abox))
         placed: list[PlacedBlock] = []
         occupied: list[BBox] = [abox]      # everything already on the canvas
 
-        for words in lines:
-            result = self._place_one(words, pool, occupied, rng)
+        for i, words in enumerate(lines):
+            make_word = make_words[i] if make_words else None
+            result = self._place_one(words, pool, occupied, rng, make_word)
             if result is None:
                 continue                   # couldn't fit anywhere this round
             block, edge, flow, bbox, fraction, word_mobjs = result
@@ -179,7 +184,7 @@ class PosterBuilder:
 
         return placed
 
-    def _place_one(self, words, pool, occupied, rng):
+    def _place_one(self, words, pool, occupied, rng, make_word=None):
         """Try edges, shrinking fraction to fit. Returns placement or None."""
         flow = self._pick_flow(rng)
         tried: list[Edge] = []
@@ -194,7 +199,7 @@ class PosterBuilder:
             while fraction >= self._min_fraction:
                 block, word_mobjs = self._fill(
                     words, edge.facing, flow, fraction * edge.length,
-                    self._color, self._aspect)
+                    self._color, self._aspect, make_word)
                 bbox = _place_on_edge(block, edge, self._buff)
                 if not _collides(bbox, occupied):
                     # success: put unused edges back so they remain available

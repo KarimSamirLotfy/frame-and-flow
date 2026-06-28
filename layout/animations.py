@@ -26,7 +26,6 @@ from manim import (
     RIGHT,
     UP,
     Animation,
-    FadeIn,
     smooth,
 )
 
@@ -54,11 +53,16 @@ class WordAnimation(Protocol):
 
 
 class PopIn:
-    """Instant-feeling fade (near-zero duration). The neutral default."""
+    """Quick opacity fade in place. The neutral default.
+
+    Uses `.animate.set_opacity` (not FadeIn) because the word is already a child
+    of the on-screen `whole` group at opacity 0; FadeIn would not reveal it.
+    """
 
     def build(self, mobj, side: Side, world_angle: float,
               run_time: float) -> Animation:
-        return FadeIn(mobj, run_time=max(run_time * 0.4, 1e-2))
+        mobj.set_opacity(0.0)
+        return mobj.animate(run_time=max(run_time * 0.5, 1e-2)).set_opacity(1.0)
 
 
 class SlideIn:

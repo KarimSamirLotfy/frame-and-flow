@@ -46,6 +46,7 @@ from layout import (
     make_aspect_fn,
 )
 from song_data import Song
+from style import Stylist, WordStyle, word_metrics
 
 SONG_PATH = os.environ.get("HACKATUNE_SONG", "data/songs/song_666407.json")
 SEED = int(os.environ.get("HACKATUNE_SEED", "7"))
@@ -93,9 +94,32 @@ class SongPoster(MovingCameraScene):
         end = END_TIME if END_TIME > 0 else song.duration
         rng = random.Random(SEED)
 
-        # ---- anchor = first lyric line, horizontal (per-word) ------------ #
+        # ---- emotion -> per-word typographic styles ---------------------- #
+        # Computed across the whole song (word order), then split per line so
+        # each line gets a make_word factory. Styling is baked in BEFORE the
+        # layout measures glyphs, so fit/zoom math sees the true styled sizes.
+        stylist = Stylist()
+        all_metrics = word_metrics(song)
+        styles_flat = [stylist.style_for(wm) for wm in all_metrics]
+        per_line_styles: list[list[WordStyle]] = []
+        idx = 0
+        for line in song.lyrics:
+            k = len(line.words)
+            per_line_styles.append(styles_flat[idx:idx + k])
+            idx += k
+
+        def make_word_factory(styles: list[WordStyle]):
+            def make_word(text: str, i: int, _color: str) -> Text:
+                s = styles[i] if i < len(styles) else WordStyle()
+                return Text(text, font=s.font, weight=s.weight,
+                            slant=s.slant, color=s.color)
+            return make_word
+
+        # ---- anchor = first lyric line, horizontal (per-word, styled) ---- #
         first = song.lyrics[0]
-        anchor_words = [Text(w.text, color=ACTIVE) for w in first.words]
+        anchor_make = make_word_factory(per_line_styles[0])
+        anchor_words = [anchor_make(w.text, i, ACTIVE)
+                        for i, w in enumerate(first.words)]
         space = anchor_words[0].height * 0.32
         anchor = VGroup(*anchor_words).arrange(RIGHT, buff=space, aligned_edge=DOWN)
         anchor.scale(ANCHOR_H / anchor.height)
@@ -111,7 +135,9 @@ class SongPoster(MovingCameraScene):
         )
         upto = len(song.lyrics) if N_LINES <= 0 else min(N_LINES, len(song.lyrics))
         rest = [line.text.split() for line in song.lyrics[1:upto]]
-        placed = builder.build(anchor, rest, rng)
+        rest_makers = [make_word_factory(per_line_styles[i])
+                       for i in range(1, upto)]
+        placed = builder.build(anchor, rest, rng, make_words=rest_makers)
 
         # ---- centre the whole composition (positions are final now) ------ #
         # We compute the full layout up front so geometry is fixed, but reveal
