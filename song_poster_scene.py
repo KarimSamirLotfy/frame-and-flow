@@ -178,6 +178,9 @@ class SongPoster(MovingCameraScene):
             nonlocal clock
             clock += dt
 
+        def clock_now() -> float:
+            return clock
+
         # Camera can't rotate in v0.20.1, so we ROTATE THE WORLD instead: spin
         # `whole` so the target line becomes horizontal, then pan/zoom to it.
         # `world_angle` is the current accumulated rotation of the composition.
@@ -197,9 +200,19 @@ class SongPoster(MovingCameraScene):
             delta = -(target_text_angle + world_angle)
             new_world_angle = world_angle + delta
 
+            # The glide must fit in the lead time before the line starts, so the
+            # timeline never runs past the song. No lead -> apply instantly (the
+            # cut is masked by the words appearing right after).
             lead = max(0.0, line_start - clock)
-            run = min(run_glide(lead), lead) if lead > 1e-3 else CAM_MIN_GLIDE
-            run = max(run, 1e-2)
+            run = min(run_glide(lead), lead)
+            if run < 1e-2:
+                # no time to animate: jump the camera/world instantly, no overhang
+                if abs(delta) > 1e-4:
+                    whole.rotate(delta, about_point=ORIGIN)
+                cx, cy, w, _ = self._frame_for_rotated(target, word_mobjs, delta)
+                self.camera.frame.move_to([cx, cy, 0]).set(width=w)
+                world_angle = new_world_angle
+                return
 
             cx, cy, w, _ = self._frame_for_rotated(target, word_mobjs, delta)
 
@@ -246,22 +259,29 @@ class SongPoster(MovingCameraScene):
         self.camera.frame.move_to([cx, cy, 0]).set(width=w)
         advance_to(first.start)
         # anchor has no aligned edge; slide it up from below (Side.DOWN), no spin
+        # next event = the next line's start (caps the last word's entrance)
+        next_start = song.lyrics[1].start if len(song.lyrics) > 1 else end
         self._reveal_words(first, anchor_words, Side.DOWN, 0.0, end,
-                           advance_to, rendering, bump)
+                           advance_to, rendering, bump, clock_now,
+                           next_event=next_start)
         if SHOW_DEBUG:
             self._outline(anchor, ANCHOR_BOX)
 
         # Then every other line: rotate-world + glide to it, then reveal words.
-        for line, p in zip(song.lyrics[1:upto], placed):
+        lyric_lines = song.lyrics[1:upto]
+        for li, (line, p) in enumerate(zip(lyric_lines, placed)):
             if line.start >= end:
                 break
             text_angle = (PI / 2) if p.flow is Flow.VERTICAL else 0.0
             glide_to(p.block, p.word_mobjs, text_angle, line.start)
             advance_to(line.start)
+            # next line's start bounds this line's last-word entrance
+            nxt = lyric_lines[li + 1].start if li + 1 < len(lyric_lines) else end
             # use the LIVE accumulated world rotation so slide offsets are
             # correct on screen (the world is spun to keep this line upright).
             self._reveal_words(line, p.word_mobjs, p.side, world_angle, end,
-                               advance_to, rendering, bump)
+                               advance_to, rendering, bump, clock_now,
+                               next_event=nxt)
             if SHOW_DEBUG:
                 self._outline(p.block, SIDE_COLOR[p.side])
 
@@ -270,13 +290,15 @@ class SongPoster(MovingCameraScene):
 
     # ------------------------------------------------------------------- #
     def _reveal_words(self, line, word_mobjs, side, world_angle, end,
-                      advance_to, rendering, bump) -> None:
+                      advance_to, rendering, bump, clock_now,
+                      next_event=None) -> None:
         """Animate each word in at its start time (per-word build-up).
 
-        Each word's entrance STARTS on its timestamp (slide begins at word.start
-        and settles ~WORD_ANIM_RT later). The play consumes run_time, which the
-        caller's clock accounts for via `advance_to`. While fast-forwarding
-        (before the render window), entrances are applied instantly.
+        Each word's entrance starts on its timestamp. CRUCIALLY, the entrance
+        run_time is CAPPED to the gap before the next event (next word, or
+        `next_event` for the last word) so the rendered timeline never runs past
+        the song. While fast-forwarding (before the render window), entrances are
+        applied instantly.
         """
         style = WORD_ANIM_STYLES.get(WORD_ANIM, WORD_ANIM_STYLES["pop"])
         words = line.words
@@ -291,9 +313,13 @@ class SongPoster(MovingCameraScene):
             if not rendering():
                 wmob.set_opacity(1.0)           # fast-forward: instant
                 continue
-            anim = style.build(wmob, side, world_angle, WORD_ANIM_RT)
-            self.play(anim)                     # starts on the beat, eases in
-            bump(WORD_ANIM_RT)                  # clock += time the play consumed
+            # cap the entrance to the time before the NEXT beat (no overhang)
+            nxt = words[i + 1].start if i + 1 < n else (next_event or t)
+            gap = max(0.0, nxt - clock_now())
+            rt = min(WORD_ANIM_RT, gap) if gap > 1e-3 else 1e-2
+            anim = style.build(wmob, side, world_angle, rt)
+            self.play(anim)
+            bump(rt)                            # clock += the (capped) run_time
 
         for j in range(n, len(word_mobjs)):     # leftovers (count mismatch)
             word_mobjs[j].set_opacity(1.0)
