@@ -144,7 +144,6 @@ open final.mp4
 
 This is the deliverable so far: 1080p60 h264, flames + kinetic typography,
 smooth playback — but **no sound yet**. Add the song's audio in Stage 3.
-
 ---
 
 ## Stage 3 — add the song audio (sync the voice)
